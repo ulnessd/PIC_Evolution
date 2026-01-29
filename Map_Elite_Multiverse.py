@@ -14,7 +14,7 @@ import math
 # ==============================================================================
 # HARDWARE SETTINGS
 NUM_WORKERS = max(1, os.cpu_count() - 2)         # Devote almost entire CPU to the active world
-BATCHES_PER_WORLD = 25_000  # How long to run each world before switching
+BATCHES_PER_WORLD = 5_000  # How long to run each world before switching
 
 # THE QUEUE (The script will run these in order)
 WORLD_QUEUE = [
@@ -298,9 +298,45 @@ def mutate_genome(genome, rate):
 
 
 def crossover_homologous(p1, p2):
+    # Rule 0: Safety Check
     if len(p1) < 2 or len(p2) < 2: return p1
-    pt = random.randint(1, min(len(p1), len(p2)) - 1)
-    return (p1[:pt] + p2[pt:])[:MAX_LINES]
+
+    roll = random.random()
+
+    # --- MECHANISM 1: HOMOLOGOUS CROSSOVER (85%) ---
+    # Standard "Cut and Splice"
+    if roll < 0.85:
+        pt = random.randint(1, min(len(p1), len(p2)) - 1)
+        return (p1[:pt] + p2[pt:])[:MAX_LINES]
+
+    # --- MECHANISM 2: TRANSPOSON INSERTION (12%) ---
+    # Copy a block from P1, insert into P2
+    elif roll < 0.97:
+        block_size = random.randint(4, 16)
+        if len(p1) <= block_size:
+            segment = list(p1)
+        else:
+            start = random.randint(0, len(p1) - block_size)
+            segment = p1[start: start + block_size]
+
+        target = list(p2)
+        insert_pt = random.randint(0, len(target))
+        child = target[:insert_pt] + segment + target[insert_pt:]
+        return child[:MAX_LINES]  # Cap size
+
+    # --- MECHANISM 3: GENE SHUFFLING (3%) ---
+    # The Nuclear Option: Randomly pick instruction from A or B for each line
+    else:
+        child = []
+        max_len = max(len(p1), len(p2))
+        for i in range(max_len):
+            if i < len(p1) and i < len(p2):
+                child.append(list(p1[i]) if random.random() < 0.5 else list(p2[i]))
+            elif i < len(p1):
+                child.append(list(p1[i]))
+            else:
+                child.append(list(p2[i]))
+        return child[:MAX_LINES]
 
 
 # ==============================================================================
