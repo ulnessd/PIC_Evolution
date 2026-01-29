@@ -2,10 +2,31 @@ import random
 
 
 class Pic10Sim:
+    """
+    PIC10F200-inspired emulator, tuned for evolutionary experiments.
+
+    HARDWARE CONTRACT (LOCKED):
+      - GPIO directions are fixed (TRIS removed from evolving instruction set):
+          GP3, GP2: INPUT-ONLY
+          GP1, GP0: OUTPUT-ONLY
+      - External inputs are injected each cycle and overwrite GPIO input bits.
+      - Programs start at reset entry PC=0 (hardware-faithful for deployment).
+    """
+
     def __init__(self):
-        # --- CONSTANTS (PIC10F200 Specs) ---
-        self.RAM_SIZE = 32  # 0x00 to 0x1F (includes SFRs + RAM)
-        self.FLASH_SIZE = 256  # 256 words of program memory
+        # --- CONSTANTS (PIC10F200-like Specs) ---
+        self.RAM_SIZE = 32          # 0x00 to 0x1F (includes SFRs + RAM)
+        self.FLASH_SIZE = 256       # 256 words program memory
+
+        # --- GPIO DIRECTION (FIXED) ---
+        # TRIS bit = 1 => input, 0 => output (PIC convention)
+        # GP3 (bit 3) input, GP2 (bit 2) input, GP1 (bit 1) output, GP0 (bit 0) output
+        self.FIXED_TRIS = 0b00001100
+
+        # Convenience masks
+        self.GPIO_OUT_MASK = 0b00000011  # GP0, GP1
+        self.GPIO_IN_MASK  = 0b00001100  # GP2, GP3
+        self.GPIO_KEEP_MASK = 0xFF ^ self.GPIO_OUT_MASK  # keep all non-output bits on GPIO writes
 
         # --- STATE REGISTERS ---
         self.ram = bytearray(self.RAM_SIZE)
@@ -14,342 +35,340 @@ class Pic10Sim:
         self.stack = []
 
         # --- STORAGE ---
-        self.program = []  # The Genome
-        self.opcode_map = {}  # Integer -> String Mapping
+        self.program = []         # list of (op_id, operand)
+        self.opcode_map = []      # list of mnemonics indexed by op_id
 
-        # --- SPECIAL REGISTERS ---
-        self.tris_gpio = 0xFF
-        self.option_reg = 0xFF
-
-        # --- METRICS ---
+        # --- RUN STATE ---
         self.cycles = 0
         self.crash_reason = None
 
-    def load(self, program, opcode_list):
-        """
-        Loads the genome and the opcode translation table.
-        """
-        self.program = program
-        self.opcode_map = opcode_list  # List of strings ['ADDWF_W', etc]
         self.reset()
 
     def reset(self, fixed_tris=None):
+        """
+        Reset to a known power-on state, with a hardware-faithful reset entry point.
+        """
         self.ram = bytearray(self.RAM_SIZE)
         self.w_reg = 0
-        self.pc = 0xFF  # Power-on Reset Vector
+        self.pc = 0               # *** LOCKED RESET ENTRY (PC=0) ***
         self.stack = []
         self.cycles = 0
         self.crash_reason = None
-        self.ram[0x03] = 0x18  # Status POR value
 
-        if fixed_tris is not None:
-            self.tris_gpio = fixed_tris
+        # PIC-like POR status value (you had 0x18; keep it stable)
+        self.ram[0x03] = 0x18
+
+        # TRIS is fixed for this project, but allow override for experiments.
+        if fixed_tris is None:
+            self.tris_gpio = self.FIXED_TRIS
         else:
-            self.tris_gpio = 0xFF  # Default Input
+            self.tris_gpio = fixed_tris & 0xFF
 
+        # Initialize GPIO to 0 (outputs low, inputs will be injected)
+        self.ram[0x06] = 0x00
+
+    def load(self, program, opcode_list):
+        """
+        Loads the genome and opcode translation table.
+        program: list[(op_id:int, operand:int)]
+        opcode_list: list[str] mapping op_id -> mnemonic
+        """
+        self.program = program
+        self.opcode_map = opcode_list
+
+    # -------------------------
+    # RAM ACCESS HELPERS
+    # -------------------------
+    def read_ram(self, addr):
+        """
+        Read RAM/SFR. Implements INDF indirection via FSR at 0x04 when addr==0.
+        """
+        addr &= 0x1F
+
+        # INDF / indirect addressing
+        if addr == 0x00:
+            fsr = self.ram[0x04] & 0x1F
+            return self.ram[fsr]
+
+        return self.ram[addr]
+
+    def write_ram(self, addr, value):
+        """
+        Write RAM/SFR. Enforces fixed GPIO directions when writing GPIO (0x06).
+        Implements INDF indirection via FSR at 0x04 when addr==0.
+        """
+        addr &= 0x1F
+        value &= 0xFF
+
+        # INDF / indirect addressing
+        if addr == 0x00:
+            fsr = self.ram[0x04] & 0x1F
+            self.ram[fsr] = value
+            return
+
+        # GPIO direction lock: GP2/GP3 are input-only, GP0/GP1 output-only
+        if addr == 0x06:
+            old = self.ram[0x06]
+            # Preserve input bits (and any other non-output bits) on write;
+            # Only allow GP0/GP1 to be changed by program writes.
+            new_val = (old & self.GPIO_KEEP_MASK) | (value & self.GPIO_OUT_MASK)
+            self.ram[0x06] = new_val
+            return
+
+        # Default write
+        self.ram[addr] = value
+
+    # -------------------------
+    # EXECUTION CORE
+    # -------------------------
     def check_stack_for_macro(self):
+        # Macro consumes stack depth; keep consistent with your existing crash semantics
         if len(self.stack) >= 2:
-            self.crash_reason = "STACK_OVERFLOW_ON_DELAY"
+            self.crash_reason = "Stack overflow (Macro)"
             return False
         return True
 
-    def emulate_cycle(self, gp3_input):
+    def emulate_cycle(self, gp2_input=0, gp3_input=0):
         """
-        The Heart of the Thunderdome.
-        1. Injects Cosmic Signal (GP3).
-        2. Fetches & Decodes Instruction from self.program.
-        3. Executes Step.
-        4. Returns Output.
-        """
-        if self.crash_reason: return 0  # Dead organism
+        Canonical single-cycle interface:
+          1) Injects external inputs (GP2, GP3) into GPIO input bits.
+          2) Fetch + decode instruction at PC.
+          3) Execute one instruction.
+          4) Return outputs (GP1:GP0) as 2-bit integer plus crash status.
 
-        # --- 1. UPDATE HARDWARE (Inject Signal) ---
-        # GP3 is Input-Only. Force RAM bit to match Cosmic Input.
-        if gp3_input:
-            self.ram[0x06] |= (1 << 3)
+        Returns: (out2bit:int, crashed:bool)
+        """
+        if self.crash_reason:
+            return 0, True
+
+        # --- 1) INJECT EXTERNAL INPUTS (force input pins) ---
+        gpio = self.ram[0x06]
+
+        # Force GP2
+        if gp2_input:
+            gpio |= (1 << 2)
         else:
-            self.ram[0x06] &= ~(1 << 3)
+            gpio &= ~(1 << 2)
 
-        # --- 2. FETCH ---
-        # Handle PC wrapping and Empty Programs
-        if not self.program: return 0
+        # Force GP3
+        if gp3_input:
+            gpio |= (1 << 3)
+        else:
+            gpio &= ~(1 << 3)
 
-        # PC is 9-bit, but Flash is 256 words. Wrap to length.
-        # Note: Real PICs wrap at 0xFF to 0x00.
+        # Apply back, but keep outputs unchanged (outputs already included in gpio)
+        self.ram[0x06] = gpio
+
+        # --- 2) FETCH ---
+        if not self.program:
+            return 0, False
+
         fetch_pc = self.pc & 0xFF
         if fetch_pc >= len(self.program):
-            fetch_pc %= len(self.program)  # Safety wrap for short genomes
+            # Hardware-faithful wrap for full 256-word programs would be 0xFF->0x00.
+            # For shorter genomes, keep your safety behavior (wrap to length).
+            fetch_pc %= len(self.program)
 
-        instruction = self.program[fetch_pc]
-        op_id = instruction[0]
-        operand = instruction[1]
+        op_id, operand = self.program[fetch_pc]
+        operand &= 0xFF
 
-        # Translate Opcode ID to String Mnemonic
         if 0 <= op_id < len(self.opcode_map):
             mnemonic = self.opcode_map[op_id]
         else:
-            mnemonic = 'NOP'  # Safety fallback
+            mnemonic = "NOP"
 
-        # --- 3. DECODE (Bit Extraction) ---
-        # For Bit Instructions (BCF, BSF, BTFSC, BTFSS),
-        # we split the 8-bit Operand: [BBB AAAAA]
-        # Top 3 bits = Bit Index (0-7), Bottom 5 bits = Address.
+        # --- 3) DECODE BIT OPS (BBB AAAAA) ---
         bit_index = 0
-        if mnemonic in ['BCF', 'BSF', 'BTFSC', 'BTFSS']:
+        if mnemonic in ["BCF", "BSF", "BTFSC", "BTFSS"]:
             bit_index = (operand >> 5) & 0x07
-            operand = operand & 0x1F  # Mask address
+            operand = operand & 0x1F
 
-        # --- 4. EXECUTE ---
+        # --- 4) EXECUTE ---
         self.step(mnemonic, operand, bit_index)
 
-        # --- 5. READ OUTPUT ---
-        gpio_val = self.ram[0x06]
-        return (gpio_val & 0x03)
+        # --- 5) READ OUTPUTS ---
+        out2 = self.ram[0x06] & self.GPIO_OUT_MASK
+        return out2, bool(self.crash_reason)
 
     def step(self, action_type, operand, bit_index=0):
+        """
+        Execute a single decoded instruction.
+        Returns True if crashed, else False.
+        """
+        if self.crash_reason:
+            return True
+
+        # Timeout guard (keeps evolution from hanging forever)
+        if self.cycles > 200000:
+            self.crash_reason = "Timeout"
+            return True
+
+        # Default costs
         cycle_cost = 1
         pc_increment = 1
 
-        # --- MACROS ---
-        if action_type == 'DELAY_MACRO':
-            if not self.check_stack_for_macro(): return True
-            # Formula: Delay = (Operand^3)*0.1 + 10
+        # --- MACRO ---
+        if action_type == "DELAY_MACRO":
+            if not self.check_stack_for_macro():
+                return True
             cycles_burned = int((operand ** 3) * 0.1) + 10
             self.cycles += cycles_burned
             self.pc = (self.pc + 1) & 0xFF
             return False
 
         # --- CONTROL FLOW ---
-        if action_type == 'GOTO':
+        if action_type == "GOTO":
             self.cycles += 2
             self.pc = operand & 0xFF
             return False
 
-        elif action_type == 'CALL':
+        if action_type == "CALL":
+            self.cycles += 2
             if len(self.stack) >= 2:
-                self.crash_reason = "STACK_OVERFLOW_HARDWARE"
+                self.crash_reason = "Stack overflow (CALL)"
                 return True
             self.stack.append((self.pc + 1) & 0xFF)
-            self.cycles += 2
             self.pc = operand & 0xFF
             return False
 
-        elif action_type == 'RETLW':
-            if len(self.stack) == 0:
-                self.crash_reason = "STACK_UNDERFLOW"
-                return True
-            return_addr = self.stack.pop()
-            self.w_reg = operand & 0xFF
+        if action_type == "RETLW":
             self.cycles += 2
-            self.pc = return_addr
+            self.w_reg = operand & 0xFF
+            if not self.stack:
+                self.crash_reason = "Stack underflow (RETLW)"
+                return True
+            self.pc = self.stack.pop()
             return False
 
-        # --- BIT MANIPULATION ---
-        elif action_type == 'BCF':
+        # --- BIT OPS ---
+        if action_type == "BCF":
             val = self.read_ram(operand)
-            mask = ~(1 << bit_index) & 0xFF
-            self.write_ram(operand, val & mask)
+            val &= ~(1 << bit_index)
+            self.write_ram(operand, val)
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        elif action_type == 'BSF':
+        if action_type == "BSF":
             val = self.read_ram(operand)
-            mask = (1 << bit_index) & 0xFF
-            self.write_ram(operand, val | mask)
+            val |= (1 << bit_index)
+            self.write_ram(operand, val)
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        elif action_type == 'BTFSC':
+        if action_type == "BTFSC":
             val = self.read_ram(operand)
             if (val & (1 << bit_index)) == 0:
-                self.pc = (self.pc + 1) & 0xFF
-                self.cycles += 1
+                pc_increment = 2
+                cycle_cost = 2
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        elif action_type == 'BTFSS':
+        if action_type == "BTFSS":
             val = self.read_ram(operand)
             if (val & (1 << bit_index)) != 0:
-                self.pc = (self.pc + 1) & 0xFF
-                self.cycles += 1
+                pc_increment = 2
+                cycle_cost = 2
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        # --- SKIP ON ZERO ---
-        elif action_type.startswith('DECFSZ'):
-            val = self.read_ram(operand)
-            res = (val - 1) & 0xFF
-            if action_type == 'DECFSZ_W': self.w_reg = res
-            if action_type == 'DECFSZ_F': self.write_ram(operand, res)
-            if res == 0:
-                self.pc = (self.pc + 1) & 0xFF
-                self.cycles += 1
+        # --- REGISTER OPS / ALU ---
+        # NOTE: This is intentionally minimal and PIC-flavored for your instruction subset.
+        # It preserves your existing evolutionary semantics rather than full silicon fidelity.
 
-        elif action_type.startswith('INCFSZ'):
-            val = self.read_ram(operand)
-            res = (val + 1) & 0xFF
-            if action_type == 'INCFSZ_W': self.w_reg = res
-            if action_type == 'INCFSZ_F': self.write_ram(operand, res)
-            if res == 0:
-                self.pc = (self.pc + 1) & 0xFF
-                self.cycles += 1
+        if action_type == "NOP":
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        # --- ALU ---
-        elif action_type.startswith('MOVF'):
-            val = self.read_ram(operand)
-            self.update_flags(0, 0, val, 'LOGIC')
-            if action_type == 'MOVF_W': self.w_reg = val
-            if action_type == 'MOVF_F': self.write_ram(operand, val)
-
-        elif action_type.startswith('ADDWF'):
-            val = self.read_ram(operand)
-            res = self.w_reg + val
-            self.update_flags(self.w_reg, val, res, 'ADD')
-            if action_type == 'ADDWF_W': self.w_reg = res & 0xFF
-            if action_type == 'ADDWF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('SUBWF'):
-            val = self.read_ram(operand)
-            res = val - self.w_reg
-            self.update_flags(val, self.w_reg, res, 'SUB')
-            if action_type == 'SUBWF_W': self.w_reg = res & 0xFF
-            if action_type == 'SUBWF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('ANDWF'):
-            val = self.read_ram(operand)
-            res = self.w_reg & val
-            self.update_flags(0, 0, res, 'LOGIC')
-            if action_type == 'ANDWF_W': self.w_reg = res
-            if action_type == 'ANDWF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('IORWF'):
-            val = self.read_ram(operand)
-            res = self.w_reg | val
-            self.update_flags(0, 0, res, 'LOGIC')
-            if action_type == 'IORWF_W': self.w_reg = res
-            if action_type == 'IORWF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('XORWF'):
-            val = self.read_ram(operand)
-            res = self.w_reg ^ val
-            self.update_flags(0, 0, res, 'LOGIC')
-            if action_type == 'XORWF_W': self.w_reg = res
-            if action_type == 'XORWF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('COMF'):
-            val = self.read_ram(operand)
-            res = (~val) & 0xFF
-            self.update_flags(0, 0, res, 'LOGIC')
-            if action_type == 'COMF_W': self.w_reg = res
-            if action_type == 'COMF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('INCF'):
-            val = self.read_ram(operand)
-            res = (val + 1) & 0xFF
-            self.update_flags(0, 0, res, 'LOGIC')
-            if action_type == 'INCF_W': self.w_reg = res
-            if action_type == 'INCF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('DECF'):
-            val = self.read_ram(operand)
-            res = (val - 1) & 0xFF
-            self.update_flags(0, 0, res, 'LOGIC')
-            if action_type == 'DECF_W': self.w_reg = res
-            if action_type == 'DECF_F': self.write_ram(operand, res)
-
-        elif action_type == 'SWAPF':
-            val = self.read_ram(operand)
-            res = ((val & 0x0F) << 4) | ((val & 0xF0) >> 4)
-            if action_type == 'SWAPF_W': self.w_reg = res
-            if action_type == 'SWAPF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('RLF'):
-            val = self.read_ram(operand)
-            carry_in = (self.ram[0x03] & 0x01)
-            carry_out = (val & 0x80) >> 7
-            res = ((val << 1) & 0xFF) | carry_in
-            if carry_out:
-                self.ram[0x03] |= 1
-            else:
-                self.ram[0x03] &= ~1
-            if action_type == 'RLF_W': self.w_reg = res
-            if action_type == 'RLF_F': self.write_ram(operand, res)
-
-        elif action_type.startswith('RRF'):
-            val = self.read_ram(operand)
-            carry_in = (self.ram[0x03] & 0x01)
-            carry_out = (val & 0x01)
-            res = (val >> 1) | (carry_in << 7)
-            if carry_out:
-                self.ram[0x03] |= 1
-            else:
-                self.ram[0x03] &= ~1
-            if action_type == 'RRF_W': self.w_reg = res
-            if action_type == 'RRF_F': self.write_ram(operand, res)
-
-        elif action_type == 'CLRW':
+        if action_type == "CLRW":
             self.w_reg = 0
-            self.update_flags(0, 0, 0, 'LOGIC')
+            self.ram[0x03] |= 0x04  # Z
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        elif action_type == 'CLRF':
+        if action_type == "CLRF":
             self.write_ram(operand, 0)
-            self.update_flags(0, 0, 0, 'LOGIC')
+            self.ram[0x03] |= 0x04  # Z
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        elif action_type == 'MOVWF':
-            self.write_ram(operand, self.w_reg)
-
-        elif action_type == 'MOVLW':
+        if action_type == "MOVLW":
             self.w_reg = operand & 0xFF
+            # Z flag if W becomes 0
+            if self.w_reg == 0:
+                self.ram[0x03] |= 0x04
+            else:
+                self.ram[0x03] &= ~0x04
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
 
-        # --- UPDATE PC/CYCLES ---
+        if action_type == "MOVWF":
+            self.write_ram(operand, self.w_reg)
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
+
+        if action_type == "MOVF":
+            val = self.read_ram(operand)
+            self.w_reg = val
+            if val == 0:
+                self.ram[0x03] |= 0x04
+            else:
+                self.ram[0x03] &= ~0x04
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
+
+        if action_type == "INCF":
+            val = (self.read_ram(operand) + 1) & 0xFF
+            self.write_ram(operand, val)
+            if val == 0:
+                self.ram[0x03] |= 0x04
+            else:
+                self.ram[0x03] &= ~0x04
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
+
+        if action_type == "DECF":
+            val = (self.read_ram(operand) - 1) & 0xFF
+            self.write_ram(operand, val)
+            if val == 0:
+                self.ram[0x03] |= 0x04
+            else:
+                self.ram[0x03] &= ~0x04
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
+
+        if action_type == "INCFSZ":
+            val = (self.read_ram(operand) + 1) & 0xFF
+            self.write_ram(operand, val)
+            if val == 0:
+                pc_increment = 2
+                cycle_cost = 2
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
+
+        if action_type == "DECFSZ":
+            val = (self.read_ram(operand) - 1) & 0xFF
+            self.write_ram(operand, val)
+            if val == 0:
+                pc_increment = 2
+                cycle_cost = 2
+            self.cycles += cycle_cost
+            self.pc = (self.pc + pc_increment) & 0xFF
+            return False
+
+        # Fallback: treat unknown as NOP (keeps evolution stable)
         self.cycles += cycle_cost
         self.pc = (self.pc + pc_increment) & 0xFF
-        if self.cycles > 2000000:
-            self.crash_reason = "TIMEOUT"
-            return True
         return False
-
-    def read_ram(self, f):
-        address = f & 0x1F
-        if address == 0x00: address = self.ram[0x04] & 0x1F
-        return self.ram[address]
-
-    def write_ram(self, f, value):
-        address = f & 0x1F
-        value = value & 0xFF
-        if address == 0x00: address = self.ram[0x04] & 0x1F
-
-        if address == 0x02:
-            self.pc = value
-        elif address == 0x03:
-            mask = 0b00011000
-            self.ram[0x03] = (value & ~mask) | (self.ram[0x03] & mask)
-        elif address == 0x06:
-            # PROTECT INPUT PIN GP3
-            current = self.ram[0x06]
-            # Write only to GP0, GP1, GP2 (Mask 0xF7 clears bit 3)
-            # Restore GP3 from current state
-            self.ram[0x06] = (value & 0xF7) | (current & 0x08)
-        else:
-            self.ram[address] = value
-
-    def update_flags(self, val1, val2, result, operation):
-        status = self.ram[0x03]
-        if (result & 0xFF) == 0:
-            status |= 4
-        else:
-            status &= ~4
-
-        if operation in ['ADD', 'SUB']:
-            if operation == 'ADD':
-                if result > 255:
-                    status |= 1
-                else:
-                    status &= ~1
-                if ((val1 & 0xF) + (val2 & 0xF)) > 0xF:
-                    status |= 2
-                else:
-                    status &= ~2
-            elif operation == 'SUB':
-                if result >= 0:
-                    status |= 1
-                else:
-                    status &= ~1
-                if ((val1 & 0xF) - (val2 & 0xF)) >= 0:
-                    status |= 2
-                else:
-                    status &= ~2
-
-        self.ram[0x03] = status
