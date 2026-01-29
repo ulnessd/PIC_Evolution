@@ -13,8 +13,8 @@ import math
 # CONFIGURATION: THE SERIAL STEAMROLLER
 # ==============================================================================
 # HARDWARE SETTINGS
-NUM_WORKERS = 30          # Devote almost entire CPU to the active world
-BATCHES_PER_WORLD = 200  # How long to run each world before switching
+NUM_WORKERS = max(1, os.cpu_count() - 2)         # Devote almost entire CPU to the active world
+BATCHES_PER_WORLD = 25_000  # How long to run each world before switching
 
 # THE QUEUE (The script will run these in order)
 WORLD_QUEUE = [
@@ -402,7 +402,7 @@ def main():
 
                 if current_batch % 10 == 0:
                     print(
-                        f"   [W{world_id}] Batch {current_batch}/{BATCHES_PER_WORLD}: BestFit={best_fit:.4f}, Rate={rate:.0f}/s")
+                        f"   [W{world_id}] Batch {current_batch}/{BATCHES_PER_WORLD}: Pop={len(archive)}, BestFit={best_fit:.4f}, Rate={rate:.0f}/s")
                     with open(metrics_file, "a") as log:
                         log.write(
                             f"{current_batch}, {elapsed:.1f}, {len(archive)}, {best_fit:.4f}, {rate:.1f}, {mut_rate}\n")
