@@ -296,10 +296,13 @@ def crossover_homologous(p1, p2):
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
-def main():
-    print("--- GAMMA HAZARD PROTOCOL: STARTING ---")
-    print(f"Physics: {PHYSICS_CYCLES} Cycles (Hard Mode) | Gamma Interval: {GAMMA_INTERVAL}")
-    print(f"Signal Injection: GP2 (Bit 2) | Output: GP0/GP1")
+# ==============================================================================
+# MAIN LOOP (With Multiverse Support)
+# ==============================================================================
+def main(max_batches=None):
+    print(f"--- WORLD INITIALIZED ---")
+    print(f"Physics: {PHYSICS_CYCLES} Cycles | Noise: {NOISE_RATE*100}%")
+    print(f"Saving Data to: {os.path.dirname(METRICS_FILE)}")
 
     archive = {}
 
@@ -307,11 +310,11 @@ def main():
     print("Seeding population...")
     initial_pop = [[random_instruction() for _ in range(random.randint(5, 20))] for _ in range(1000)]
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+    # Temporary executor for seeding
+    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as seed_executor:
         chunk_size = max(1, len(initial_pop) // NUM_WORKERS)
         chunks = [initial_pop[i:i + chunk_size] for i in range(0, len(initial_pop), chunk_size)]
-
-        futures = [executor.submit(worker, c) for c in chunks]
+        futures = [seed_executor.submit(worker, c) for c in chunks]
         for f in concurrent.futures.as_completed(futures):
             for res in f.result():
                 prog, fit, mets = res
@@ -331,47 +334,57 @@ def main():
     current_batch = 0
     total_orgs = 0
 
-    while True:
-        current_batch += 1
+    # --- PERSISTENT POOL (Performance Fix) ---
+    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        
+        while True:
+            current_batch += 1
 
-        # Gamma Logic
-        cycle_pos = current_batch % GAMMA_INTERVAL
-        is_gamma = cycle_pos < GAMMA_DURATION
-        mut_rate = GAMMA_MUTATION_RATE if is_gamma else BASE_MUTATION_RATE
+            # --- STOP CONDITION (The Test/Production Limit) ---
+            if max_batches is not None and current_batch > max_batches:
+                print(f"🛑 LIMIT REACHED: Batch {current_batch-1} complete. Stopping Simulation.")
+                break
 
-        if is_gamma and cycle_pos == 0:
-            print(f"\n*** GAMMA RAY BURST INITIATED (Rate: {mut_rate}) ***\n")
+            # Gamma Logic
+            cycle_pos = current_batch % GAMMA_INTERVAL
+            is_gamma = cycle_pos < GAMMA_DURATION
+            mut_rate = GAMMA_MUTATION_RATE if is_gamma else BASE_MUTATION_RATE
 
-        # Breeding
-        is_sexual = (current_batch % SEXUAL_EPOCH_INTERVAL == 0)
-        archive_list = list(archive.values())
-        if not archive_list: break
+            if is_gamma and cycle_pos == 0:
+                print(f"\n*** GAMMA RAY BURST INITIATED (Rate: {mut_rate}) ***\n")
 
-        target_size = max(MIN_BATCH, min(MAX_BATCH, int(len(archive) * BATCH_PCT)))
-        parents = []
+            # Breeding
+            is_sexual = (current_batch % SEXUAL_EPOCH_INTERVAL == 0)
+            archive_list = list(archive.values())
+            if not archive_list: break
 
-        # Asexual
-        for _ in range(target_size):
-            p = random.choice(archive_list)["genome"]
-            parents.append(mutate_genome(p, mut_rate))
+            target_size = max(MIN_BATCH, min(MAX_BATCH, int(len(archive) * BATCH_PCT)))
+            parents = []
 
-        # Sexual
-        if is_sexual:
-            print(f"--- [SEXUAL EPOCH] Batch {current_batch} ---")
-            num_pairs = int(len(archive) * SEXUAL_POP_PCT)
-            for _ in range(num_pairs):
-                p1 = random.choice(archive_list)["genome"]
-                p2 = random.choice(archive_list)["genome"]
-                child = crossover_homologous(p1, p2)
-                parents.append(mutate_genome(child, mut_rate))
+            # Asexual
+            for _ in range(target_size):
+                p = random.choice(archive_list)["genome"]
+                parents.append(mutate_genome(p, mut_rate))
 
-        # Simulation
-        total_orgs += len(parents)
-        with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            # Sexual
+            if is_sexual:
+                print(f"--- [SEXUAL EPOCH] Batch {current_batch} ---")
+                num_pairs = int(len(archive) * SEXUAL_POP_PCT)
+                for _ in range(num_pairs):
+                    p1 = random.choice(archive_list)["genome"]
+                    p2 = random.choice(archive_list)["genome"]
+                    child = crossover_homologous(p1, p2)
+                    parents.append(mutate_genome(child, mut_rate))
+
+            # Simulation
+            total_orgs += len(parents)
+            
             chunk_size = max(1, len(parents) // NUM_WORKERS)
             chunks = [parents[i:i + chunk_size] for i in range(0, len(parents), chunk_size)]
 
+            # Submit jobs to existing pool
             futures = [executor.submit(worker, c) for c in chunks]
+            
             for f in concurrent.futures.as_completed(futures):
                 for res in f.result():
                     prog, fit, mets = res
@@ -380,60 +393,60 @@ def main():
                     if idx not in archive or fit > archive[idx]["fitness"]:
                         archive[idx] = {"genome": prog, "fitness": fit, "metrics": mets}
 
-        # Reporting
-        elapsed = time.time() - start_time
-        best_fit = max([v["fitness"] for v in archive.values()]) if archive else 0
-        rate = total_orgs / elapsed if elapsed > 0 else 0
+            # Reporting
+            elapsed = time.time() - start_time
+            best_fit = max([v["fitness"] for v in archive.values()]) if archive else 0
+            rate = total_orgs / elapsed if elapsed > 0 else 0
 
-        if current_batch % 50 == 0:
-            print(
-                f"Batch {current_batch}: Pop={len(archive)}, BestFit={best_fit:.4f}, Rate={rate:.1f} org/s, Mut={mut_rate}")
+            if current_batch % 50 == 0:
+                print(
+                    f"Batch {current_batch}: Pop={len(archive)}, BestFit={best_fit:.4f}, Rate={rate:.1f} org/s, Mut={mut_rate}")
 
-        if current_batch % BACKUP_INTERVAL_BATCHES == 0:
-            fname = f"{BACKUP_PREFIX}_{current_batch}.json.gz"
-            try:
-                with gzip.open(fname, 'wt', encoding='utf-8') as f:
-                    json.dump({str(k): v for k, v in archive.items()}, f)
-                print(f"Saved {fname}")
-                with open(METRICS_FILE, "a") as log:
-                    log.write(
-                        f"Batch {current_batch}: Time={elapsed:.1f}, Pop={len(archive)}, BestFit={best_fit:.4f}, Rate={rate:.1f}, Mut={mut_rate}\n")
-            except Exception as e:
-                print(f"Backup Error: {e}")
+            if current_batch % BACKUP_INTERVAL_BATCHES == 0:
+                fname = f"{BACKUP_PREFIX}_{current_batch}.json.gz"
+                try:
+                    with gzip.open(fname, 'wt', encoding='utf-8') as f:
+                        json.dump({str(k): v for k, v in archive.items()}, f)
+                    print(f"Saved {fname}")
+                    with open(METRICS_FILE, "a") as log:
+                        log.write(
+                            f"Batch {current_batch}: Time={elapsed:.1f}, Pop={len(archive)}, BestFit={best_fit:.4f}, Rate={rate:.1f}, Mut={mut_rate}\n")
+                except Exception as e:
+                    print(f"Backup Error: {e}")
 
 
+# ==============================================================================
+# ENTRY POINT (Handles Multiverse Args)
+# ==============================================================================
 if __name__ == "__main__":
     import argparse
-    import os
     import sys
+    import os
 
-    # 1. Parse Command Line Arguments
+    # 1. Parse Arguments (From Launcher or Command Line)
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", type=int, default=0, help="World ID (0-9)")
     parser.add_argument("--cycles", type=int, default=12000, help="Physics Cycles")
     parser.add_argument("--noise", type=float, default=0.02, help="Noise Rate")
+    parser.add_argument("--batches", type=int, default=None, help="Stop after N batches (Optional)")
+    
     args = parser.parse_args()
 
     # 2. OVERWRITE GLOBALS
-    # On Linux (Sys76), these changes propagate to worker processes automatically.
-    # On Windows, this requires careful handling, but for Sys76 this is safe.
+    # This allows the launcher to control the physics per process
     PHYSICS_CYCLES = args.cycles
     NOISE_RATE = args.noise
     
     # 3. Setup World Directory
-    # Each world gets its own folder: "World_0", "World_1", etc.
+    # Files go into "World_0/", "World_1/", etc.
     run_dir = f"World_{args.id}"
     os.makedirs(run_dir, exist_ok=True)
     
-    # 4. Redirect Outputs to that Directory
+    # 4. Redirect Outputs
     METRICS_FILE = os.path.join(run_dir, f"Metrics_W{args.id}.txt")
     BACKUP_PREFIX = os.path.join(run_dir, f"backup_W{args.id}")
 
-    # 5. Visual Confirmation
-    print(f"\n🌍 WORLD {args.id} INITIALIZED")
-    print(f"   path: {run_dir}/")
-    print(f"   phys: {PHYSICS_CYCLES} cycles")
-    print(f"   noise: {NOISE_RATE*100}%\n")
+    # 5. Launch Main
+    # Pass the limit if it exists
+    main(max_batches=args.batches)
 
-    # 6. Start Simulation
-    main()
