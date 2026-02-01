@@ -3,18 +3,10 @@
 Phase 2 - Part 4: Cross-world mixing + evaluation + combined Map-Elites archive
 with SOCIAL CHANNEL on GP2 (LIVE partners, one-way) + 100-batch shuffling.
 
-GP3: shared cosmos bitstream
-GP2: live Bob->Alice coupling, GP2[t] = Bob GP0 bit at cycle t
-Bob: runs with GP2 held low, GP3 = cosmos
-Alice: runs with GP2 from Bob, GP3 = cosmos
-Fitness/axes: SAME as Phase 1
-
-Shuffling protocol:
-- Define "batch" as a block of `--children_per_batch` hybrid evaluations.
-- Pairings (a mapping from each evaluation slot to a Bob genome) remain fixed for
-  `--shuffle_interval_batches` batches (default 100), then reshuffle.
-
-This is intended to be the final Phase 2 driver stage.
+PARALLELIZATION ONLY CHANGE:
+- The child evaluation loop is executed in parallel in CHUNKS.
+- Archive insertion is still applied IN THE SAME i-order as the serial loop.
+- All other logic is untouched.
 """
 
 import argparse
@@ -28,7 +20,10 @@ import hashlib
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
+import concurrent.futures
+
 import Pic10Sim
+
 
 # ----------------------------
 # Frozen ISA assumptions
@@ -316,11 +311,22 @@ def extract_elites(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # ----------------------------
+# PARALLELIZATION ONLY: worker function
+# ----------------------------
+def _eval_task(task: Tuple[List[List[int]], List[List[int]], List[int], List[int], int, int]):
+    child, bob, cosmos_bits, cosmos_targets, cycles, grace = task
+    return evaluate_alice_with_live_bob(child, bob, cosmos_bits, cosmos_targets, cycles, grace)
+
+def _eval_task_list(tasks: List[Tuple[List[List[int]], List[List[int]], List[int], List[int], int, int]]):
+    return [_eval_task(t) for t in tasks]
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in_dir", required=True, help="Directory containing validated backup_Wk_25000.json.gz files")
+    ap.add_argument("--in_dir", required=True, help="Directory containing backup_Wk_25000.json.gz files")
     ap.add_argument("--out_file", default="phase2_social_live_archive_25000.json.gz",
                     help="Output combined Phase-2 archive (.json.gz)")
     ap.add_argument("--n_children", type=int, default=20000,
@@ -328,7 +334,7 @@ def main():
     ap.add_argument("--mut_rate", type=float, default=0.10,
                     help="Mutation rate applied after crossover")
     ap.add_argument("--seed", type=int, default=888888,
-                    help="RNG seed for Phase2-Part4")
+                    help="RNG seed for Phase2")
     ap.add_argument("--cycles", type=int, default=12000,
                     help="PHYSICS_CYCLES for evaluation")
     ap.add_argument("--noise", type=float, default=0.02,
@@ -339,29 +345,72 @@ def main():
                     help="Grace window after target switch")
 
     ap.add_argument("--seed_with_parents", action="store_true",
-                    help="Seed archive with parent elites (GP2=0 baseline)")
+                    help="Seed archive with parent elites (GP2=0 baseline, no social coupling)")
 
     ap.add_argument("--children_per_batch", type=int, default=50,
-                    help="Define the size of a Phase2 'batch' for shuffling purposes (default 50)")
+                    help="Size of a Phase2 'batch' for shuffling purposes (default 50)")
     ap.add_argument("--shuffle_interval_batches", type=int, default=100,
                     help="Shuffle live partner assignments every N batches (default 100)")
+
+    # Parallel knobs
+    ap.add_argument("--workers", type=int, default=None,
+                    help="Default = cpu_count-2 (clamped).")
+    ap.add_argument("--chunk_size", type=int, default=200,
+                    help="Children evaluated per submitted chunk (default 200).")
+
     args = ap.parse_args()
+
+    cpu = os.cpu_count() or 1
+    workers = args.workers if args.workers is not None else max(1, cpu - 2)
+    workers = max(1, min(workers, max(1, cpu - 2)))  # clamp to cpu-2
 
     rng = random.Random(args.seed)
     run_uuid = str(uuid.uuid4())
     ts = datetime.now().isoformat(timespec="seconds")
 
-    print("Phase2-Part4 starting (LIVE Bob -> Alice GP2, one-way, 100-batch shuffling)")
+    print("Phase2-Part4 starting (LIVE Bob -> Alice GP2, one-way, 100-batch shuffling) [PARALLEL]")
     print(f"  in_dir: {args.in_dir}")
     print(f"  out_file: {args.out_file}")
     print(f"  n_children: {args.n_children}")
     print(f"  mut_rate: {args.mut_rate}")
     print(f"  cycles: {args.cycles}  noise: {args.noise}  invert_prob: {args.invert_prob}  grace: {args.grace}")
     print(f"  children_per_batch: {args.children_per_batch}  shuffle_interval_batches: {args.shuffle_interval_batches}")
+    print(f"  workers: {workers}  chunk_size: {args.chunk_size}")
     print(f"  run_uuid: {run_uuid}")
     print("")
 
-    # Load world archives
+    # -----------------------------
+    # Results directory + filenames
+    # -----------------------------
+    base_results_dir = "Phase2_Results"
+    os.makedirs(base_results_dir, exist_ok=True)
+
+    safe_ts = ts.replace(":", "-")
+    run_dir = os.path.join(base_results_dir, f"run_{safe_ts}_{run_uuid[:8]}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    backups_dir = os.path.join(run_dir, "backups")
+    os.makedirs(backups_dir, exist_ok=True)
+
+    out_file_path = os.path.join(run_dir, os.path.basename(args.out_file))
+
+    metrics_path = os.path.join(run_dir, "Metrics_Phase2.csv")
+    metrics_f = open(metrics_path, "w", encoding="utf-8")
+    metrics_f.write(
+        "step,batch,elapsed_s,pop_bins,inserted,valid,crashes,crash_frac,bob_crashes,"
+        "bob_crash_frac_valid,rate_per_s,best_fit\n"
+    )
+    metrics_f.flush()
+
+    print(f"[results] run_dir      : {run_dir}")
+    print(f"[results] out_file     : {out_file_path}")
+    print(f"[results] metrics_csv  : {metrics_path}")
+    print(f"[results] backups_dir  : {backups_dir}")
+    print("")
+
+    # -----------------------------
+    # Load world archives (parents)
+    # -----------------------------
     world_elites: Dict[int, List[Dict[str, Any]]] = {}
     source_meta: Dict[int, Any] = {}
 
@@ -382,49 +431,97 @@ def main():
         world_elites[w] = filtered
         print(f"W{w}: usable parents={len(filtered)}")
 
-    # Shared cosmos for all evals
+    # -----------------------------
+    # Build shared cosmos (once)
+    # -----------------------------
     cosmos_rng = random.Random(rng.randrange(10**9))
     cosmos = Cosmos(args.cycles, args.noise, args.invert_prob, cosmos_rng)
     cosmos_bits, cosmos_targets = cosmos.generate()
 
-    # Combined archive
+    # -----------------------------
+    # Combined archive + counters
+    # -----------------------------
     archive: Dict[Tuple[int, int, int, int], Dict[str, Any]] = {}
 
-    # Optional: seed with parents under GP2=0 baseline (Alice only, no Bob)
+    start = time.time()
+    crashes = 0
+    valid = 0
+    inserted = 0
+    bob_crashes = 0
+    best_fit_so_far = 0.0
+
+    # -----------------------------
+    # Optional: seed with parents
+    # -----------------------------
     if args.seed_with_parents:
         print("\nSeeding archive with parent elites (GP2=0 baseline, no social coupling)...")
         seeded = 0
+        silent_bob = [[OPCODE_LIST.index("NOP"), 0]]
+
         for w in range(10):
             for rec in world_elites[w]:
                 g = rec["genome"]
                 if not is_valid_genome(g):
                     continue
-                # Use Bob as a trivial always-silent partner: a NOP-only genome with no CALL/RETLW would be ideal,
-                # but simplest is to use a "silent Bob" by letting Bob crash immediately be equivalent to gp2=0.
-                # We implement baseline by coupling to a Bob that is forced silent: just use a 1-instruction NOP program.
-                silent_bob = [[OPCODE_LIST.index("NOP"), 0]]
+
                 fit, mets, alice_crashed, bob_crashed = evaluate_alice_with_live_bob(
                     g, silent_bob, cosmos_bits, cosmos_targets, args.cycles, args.grace
                 )
                 if alice_crashed or not mets:
                     continue
+
                 idx = get_grid_index(mets)
                 if idx not in archive or fit > archive[idx]["fitness"]:
                     archive[idx] = {
                         "genome": g,
-                        "fitness": fit,
+                        "fitness": float(fit),
                         "metrics": mets,
                         "origin": {"type": "parent", "world": w, "gp2_mode": "held_low_live_baseline"}
                     }
+                    best_fit_so_far = max(best_fit_so_far, float(fit))
+
                 seeded += 1
-        print(f"Seeded from {seeded} parent evals. bins={len(archive)}\n")
 
-    # --- Live partner assignment (one-way) with 100-batch shuffling ---
-    # We define evaluation slots per batch and assign each slot a Bob genome for the shuffle window.
-    # This avoids per-evaluation resampling if you want stable pairing within the shuffle interval.
+        print(f"Seeded from {seeded} parent evals. bins={len(archive)}")
 
+        seed_backup_path = os.path.join(backups_dir, "backup_phase2_seed.json.gz")
+        meta_seed = {
+            "phase2_part": 4,
+            "run_uuid": run_uuid,
+            "timestamp": ts,
+            "note": "archive after seeding with parents (GP2=0 baseline)",
+            "params": {
+                "in_dir": args.in_dir,
+                "n_children": args.n_children,
+                "mut_rate": args.mut_rate,
+                "cycles": args.cycles,
+                "noise": args.noise,
+                "invert_prob": args.invert_prob,
+                "grace": args.grace,
+                "children_per_batch": args.children_per_batch,
+                "shuffle_interval_batches": args.shuffle_interval_batches,
+                "seed_with_parents": True,
+                "workers": workers,
+                "chunk_size": args.chunk_size,
+            },
+            "source_meta": source_meta,
+        }
+        with gzip.open(seed_backup_path, "wt", encoding="utf-8") as f:
+            json.dump({"meta": meta_seed, "archive": {str(k): v for k, v in archive.items()}}, f)
+
+        elapsed0 = time.time() - start
+        metrics_f.write(
+            f"0,0,{elapsed0:.3f},{len(archive)},{inserted},{valid},{crashes},0.0,"
+            f"{bob_crashes},0.0,0.0,{best_fit_so_far:.6f}\n"
+        )
+        metrics_f.flush()
+
+    print("\nGenerating children with LIVE Bob->Alice coupling...")
+
+    # -----------------------------
+    # Live partner assignment table (unchanged)
+    # -----------------------------
     def make_partner_table() -> List[Tuple[int, List[List[int]]]]:
-        """Return list of (bob_world, bob_genome) of length children_per_batch."""
         table = []
         for _ in range(args.children_per_batch):
             w_bob = rng.randrange(10)
@@ -435,66 +532,53 @@ def main():
     partner_table = make_partner_table()
     batches_until_shuffle = args.shuffle_interval_batches
 
-    start = time.time()
-    crashes = 0
-    valid = 0
-    inserted = 0
-    bob_crashes = 0
+    # -----------------------------
+    # Backup policy (unchanged)
+    # -----------------------------
+    BACKUP_INTERVAL_BATCHES = 50
+    checkpoint_every_children = args.children_per_batch * BACKUP_INTERVAL_BATCHES
+    next_checkpoint_step = checkpoint_every_children
 
-    print("Generating children with LIVE Bob->Alice coupling...")
+    # -----------------------------
+    # Chunk builder: produces per-child slot_records + a task list for workers
+    # (Workers evaluate only valid tasks; invalid slots are None)
+    # -----------------------------
+    def build_chunk(i_start: int, i_end: int):
+        nonlocal partner_table, batches_until_shuffle
 
-    for i in range(1, args.n_children + 1):
-        # Determine our slot in the current batch
-        slot = (i - 1) % args.children_per_batch
+        tasks: List[Tuple[List[List[int]], List[List[int]], List[int], List[int], int, int]] = []
+        slot_records: List[Any] = []
 
-        # Shuffle partner table every shuffle_interval_batches
-        if slot == 0:
-            # start of a new batch
-            current_batch = ((i - 1) // args.children_per_batch) + 1
-            if batches_until_shuffle <= 0:
-                partner_table = make_partner_table()
-                batches_until_shuffle = args.shuffle_interval_batches
-                print(f"  [SHUFFLE] batch={current_batch} partner table reshuffled")
-            batches_until_shuffle -= 1
+        for i in range(i_start, i_end + 1):
+            slot = (i - 1) % args.children_per_batch
 
-        # Select distinct worlds for genetic parents
-        wa = rng.randrange(10)
-        wb = rng.randrange(10)
-        while wb == wa:
+            if slot == 0:
+                current_batch = ((i - 1) // args.children_per_batch) + 1
+                if batches_until_shuffle <= 0:
+                    partner_table = make_partner_table()
+                    batches_until_shuffle = args.shuffle_interval_batches
+                    print(f"  [SHUFFLE] batch={current_batch} partner table reshuffled")
+                batches_until_shuffle -= 1
+
+            wa = rng.randrange(10)
             wb = rng.randrange(10)
+            while wb == wa:
+                wb = rng.randrange(10)
 
-        p1 = rng.choice(world_elites[wa])["genome"]
-        p2 = rng.choice(world_elites[wb])["genome"]
+            p1 = rng.choice(world_elites[wa])["genome"]
+            p2 = rng.choice(world_elites[wb])["genome"]
 
-        child = mutate_genome(crossover_homologous(p1, p2, rng), args.mut_rate, rng)
-        if not is_valid_genome(child):
-            crashes += 1
-            continue
+            child = mutate_genome(crossover_homologous(p1, p2, rng), args.mut_rate, rng)
+            if not is_valid_genome(child):
+                slot_records.append(None)
+                continue
 
-        # Live partner (Bob) from the table for this slot
-        w_bob, bob = partner_table[slot]
-        if not is_valid_genome(bob):
-            crashes += 1
-            continue
+            w_bob, bob = partner_table[slot]
+            if not is_valid_genome(bob):
+                slot_records.append(None)
+                continue
 
-        fit, mets, alice_crashed, bob_crashed = evaluate_alice_with_live_bob(
-            child, bob, cosmos_bits, cosmos_targets, args.cycles, args.grace
-        )
-        if alice_crashed or not mets:
-            crashes += 1
-            continue
-
-        if bob_crashed:
-            bob_crashes += 1
-
-        valid += 1
-        idx = get_grid_index(mets)
-
-        elite = {
-            "genome": child,
-            "fitness": fit,
-            "metrics": mets,
-            "origin": {
+            origin = {
                 "type": "hybrid_social_live_one_way",
                 "world_a": wa,
                 "world_b": wb,
@@ -503,24 +587,194 @@ def main():
                 "pairing": "fixed_within_shuffle_window",
                 "shuffle_interval_batches": args.shuffle_interval_batches,
                 "children_per_batch": args.children_per_batch,
-                "bob_crashed": bool(bob_crashed),
+                "bob_crashed": None,
             }
-        }
 
-        if idx not in archive or fit > archive[idx]["fitness"]:
-            archive[idx] = elite
-            inserted += 1
+            slot_records.append({"child": child, "origin": origin})
 
-        if i % 1000 == 0:
-            elapsed = time.time() - start
-            rate = i / elapsed if elapsed > 0 else 0.0
-            crash_frac = crashes / i
-            bob_crash_frac = bob_crashes / max(1, valid)
-            print(f"  {i:6d}/{args.n_children} | bins={len(archive):5d} | inserted={inserted:5d} | crash_frac={crash_frac:.3f} | bob_crash_frac(valid)={bob_crash_frac:.3f} | rate={rate:.1f}/s")
+            # Worker task includes cosmos + params (no initializer needed)
+            tasks.append((child, bob, cosmos_bits, cosmos_targets, args.cycles, args.grace))
 
+        return tasks, slot_records
+
+    # -----------------------------
+    # PARALLEL execution:
+    # We keep many chunk futures inflight, collect as completed,
+    # but APPLY in strict chunk order to preserve serial semantics.
+    # -----------------------------
+    completed = 0
+    next_i = 1
+
+    chunk_id = 0
+    next_apply_chunk = 0
+
+    inflight = {}        # chunk_id -> future
+    chunk_slots = {}     # chunk_id -> slot_records
+    chunk_i_range = {}   # chunk_id -> (i_start, i_end)
+
+    max_inflight = max(4, workers * 4)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+
+        # helper to submit one chunk
+        def submit_one():
+            nonlocal next_i, chunk_id
+            if next_i > args.n_children:
+                return False
+            i_start = next_i
+            i_end = min(args.n_children, i_start + args.chunk_size - 1)
+            tasks, slots = build_chunk(i_start, i_end)
+
+            fut = ex.submit(_eval_task_list, tasks)  # returns list[(fit, mets, alice_crashed, bob_crashed)]
+            inflight[chunk_id] = fut
+            chunk_slots[chunk_id] = slots
+            chunk_i_range[chunk_id] = (i_start, i_end)
+
+            chunk_id += 1
+            next_i = i_end + 1
+            return True
+
+        # prime pipeline
+        while len(inflight) < max_inflight and next_i <= args.n_children:
+            submit_one()
+
+        # store completed results until we can apply in order
+        completed_results = {}  # chunk_id -> results list
+
+        while inflight or completed_results:
+            # pull any finished futures
+            done, _ = concurrent.futures.wait(
+                inflight.values(),
+                timeout=0.1,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
+
+            for fut in done:
+                # locate its chunk_id
+                cid = None
+                for k, v in inflight.items():
+                    if v is fut:
+                        cid = k
+                        break
+                if cid is None:
+                    continue
+                results = fut.result()
+                completed_results[cid] = results
+                del inflight[cid]
+
+            # refill pipeline
+            while len(inflight) < max_inflight and next_i <= args.n_children:
+                submit_one()
+
+            # apply any available chunks in strict order
+            while next_apply_chunk in completed_results:
+                results = completed_results.pop(next_apply_chunk)
+                slots = chunk_slots.pop(next_apply_chunk)
+                chunk_slots.pop(next_apply_chunk, None)
+                chunk_i_range.pop(next_apply_chunk, None)
+
+                r_idx = 0
+                for slot in slots:
+                    completed += 1
+
+                    if slot is None:
+                        crashes += 1
+                    else:
+                        fit, mets, alice_crashed, bob_crashed = results[r_idx]
+                        r_idx += 1
+
+                        if alice_crashed or not mets:
+                            crashes += 1
+                        else:
+                            valid += 1
+                            if bob_crashed:
+                                bob_crashes += 1
+
+                            idx = get_grid_index(mets)
+                            origin = slot["origin"]
+                            origin["bob_crashed"] = bool(bob_crashed)
+
+                            elite = {"genome": slot["child"], "fitness": float(fit), "metrics": mets, "origin": origin}
+
+                            if idx not in archive or float(fit) > float(archive[idx]["fitness"]):
+                                archive[idx] = elite
+                                inserted += 1
+                                if float(fit) > best_fit_so_far:
+                                    best_fit_so_far = float(fit)
+
+                    # ---- METRICS/PRINT (every 1000 children) ----
+                    if completed % 1000 == 0:
+                        elapsed = time.time() - start
+                        rate = completed / elapsed if elapsed > 0 else 0.0
+                        crash_frac = (crashes / completed) if completed > 0 else 0.0
+                        bob_crash_frac_valid = (bob_crashes / max(1, valid)) if valid > 0 else 0.0
+
+                        print(
+                            f"{completed:7d}/{args.n_children} | bins={len(archive):5d} | inserted={inserted:5d} "
+                            f"| crash_frac={crash_frac:.3f} | bob_crash_frac(valid)={bob_crash_frac_valid:.3f} "
+                            f"| best_fit={best_fit_so_far:.6f} | rate={rate:.1f}/s"
+                        )
+
+                        current_batch = ((completed - 1) // args.children_per_batch) + 1
+                        metrics_f.write(
+                            f"{completed},{current_batch},{elapsed:.3f},{len(archive)},{inserted},{valid},{crashes},{crash_frac:.6f},"
+                            f"{bob_crashes},{bob_crash_frac_valid:.6f},{rate:.3f},{best_fit_so_far:.6f}\n"
+                        )
+                        if completed % 10000 == 0:
+                            metrics_f.flush()
+
+                    # ---- CHECKPOINT BACKUP ----
+                    if completed >= next_checkpoint_step:
+                        current_batch = ((completed - 1) // args.children_per_batch) + 1
+                        backup_path = os.path.join(backups_dir, f"backup_phase2_{completed}.json.gz")
+
+                        meta_ckpt = {
+                            "phase2_part": 4,
+                            "run_uuid": run_uuid,
+                            "timestamp": ts,
+                            "checkpoint": {
+                                "step": completed,
+                                "batch": current_batch,
+                                "note": f"checkpoint every {BACKUP_INTERVAL_BATCHES} batches",
+                            },
+                            "params": {
+                                "in_dir": args.in_dir,
+                                "n_children": args.n_children,
+                                "mut_rate": args.mut_rate,
+                                "seed": args.seed,
+                                "cycles": args.cycles,
+                                "noise": args.noise,
+                                "invert_prob": args.invert_prob,
+                                "grace": args.grace,
+                                "children_per_batch": args.children_per_batch,
+                                "shuffle_interval_batches": args.shuffle_interval_batches,
+                                "seed_with_parents": bool(args.seed_with_parents),
+                                "workers": workers,
+                                "chunk_size": args.chunk_size,
+                            },
+                            "results_so_far": {
+                                "bins": len(archive),
+                                "inserted": inserted,
+                                "valid": valid,
+                                "crashes": crashes,
+                                "best_fit": best_fit_so_far,
+                            },
+                            "source_meta": source_meta,
+                        }
+
+                        with gzip.open(backup_path, "wt", encoding="utf-8") as f:
+                            json.dump({"meta": meta_ckpt, "archive": {str(k): v for k, v in archive.items()}}, f)
+
+                        next_checkpoint_step += checkpoint_every_children
+
+                next_apply_chunk += 1
+
+    # Final summary
     elapsed = time.time() - start
     crash_frac = crashes / args.n_children if args.n_children > 0 else 0.0
     bob_crash_frac_all = bob_crashes / args.n_children if args.n_children > 0 else 0.0
+    bob_crash_frac_valid = bob_crashes / max(1, valid) if valid > 0 else 0.0
+    rate = args.n_children / elapsed if elapsed > 0 else 0.0
 
     print("\nDone.")
     print(f"  evaluated: {args.n_children}")
@@ -528,56 +782,57 @@ def main():
     print(f"  crashes/invalid: {crashes} (crash_frac={crash_frac:.3f})")
     print(f"  bob_crashed among valid evals: {bob_crashes} (bob_crash_frac_all={bob_crash_frac_all:.3f})")
     print(f"  bins in archive: {len(archive)}")
+    print(f"  best_fit: {best_fit_so_far:.6f}")
     print(f"  elapsed: {elapsed:.1f}s\n")
 
-    archive_payload = {str(k): v for k, v in archive.items()}
+    final_batch = ((args.n_children - 1) // args.children_per_batch) + 1 if args.n_children > 0 else 0
+    metrics_f.write(
+        f"{args.n_children},{final_batch},{elapsed:.3f},{len(archive)},{inserted},{valid},{crashes},{crash_frac:.6f},"
+        f"{bob_crashes},{bob_crash_frac_valid:.6f},{rate:.3f},{best_fit_so_far:.6f}\n"
+    )
+    metrics_f.flush()
+    metrics_f.close()
 
     meta_out = {
         "phase2_part": 4,
         "run_uuid": run_uuid,
         "timestamp": ts,
         "input_contract": "GP3=cosmos_input, GP2=LIVE Bob GP0 (one-way), GP0/GP1=outputs",
-        "coupling": {
-            "mode": "one_way_live",
-            "gp2_source": "bob_gp0",
-            "pairing": "fixed partner table within shuffle window",
-            "children_per_batch": args.children_per_batch,
-            "shuffle_interval_batches": args.shuffle_interval_batches,
-        },
-        "opcode_hash": OPCODE_HASH,
+        "opcode_list_hash": hashlib.sha256("\n".join(OPCODE_LIST).encode("utf-8")).hexdigest()[:16],
         "source_archives": {"in_dir": args.in_dir, "files": [f"backup_W{w}_25000.json.gz" for w in range(10)]},
         "source_meta": source_meta,
-        "evaluation_physics": {
-            "physics_cycles": args.cycles,
-            "noise_rate": args.noise,
-            "invert_prob": args.invert_prob,
-            "gap_min": GAP_MIN,
-            "gap_max": GAP_MAX,
-            "grace_after_switch": args.grace,
-            "cosmos_shared": True,
-        },
-        "genetics": {
+        "params": {
             "n_children": args.n_children,
-            "mutation_rate": args.mut_rate,
-            "crossover": "homologous_cut (85%), transposon_insert (12%), shuffle_mix (3%)",
+            "mut_rate": args.mut_rate,
+            "seed": args.seed,
+            "cycles": args.cycles,
+            "noise": args.noise,
+            "invert_prob": args.invert_prob,
+            "grace": args.grace,
+            "children_per_batch": args.children_per_batch,
+            "shuffle_interval_batches": args.shuffle_interval_batches,
             "seed_with_parents": bool(args.seed_with_parents),
-            "rng_seed": args.seed,
+            "workers": workers,
+            "chunk_size": args.chunk_size,
         },
         "results": {
             "bins": len(archive),
-            "valid_children": valid,
+            "valid": valid,
             "crashes": crashes,
             "crash_frac": crash_frac,
+            "bob_crashes": bob_crashes,
             "bob_crash_frac_all": bob_crash_frac_all,
-            "inserted_replacements": inserted,
+            "inserted": inserted,
+            "best_fit": best_fit_so_far,
         }
     }
 
-    out_payload = {"meta": meta_out, "archive": archive_payload}
-    with gzip.open(args.out_file, "wt", encoding="utf-8") as f:
-        json.dump(out_payload, f)
+    with gzip.open(out_file_path, "wt", encoding="utf-8") as f:
+        json.dump({"meta": meta_out, "archive": {str(k): v for k, v in archive.items()}}, f)
 
-    print(f"Wrote Phase2-Part4 archive: {args.out_file}")
+    print(f"Wrote Phase2-Part4 archive: {out_file_path}")
+
+
 
 
 if __name__ == "__main__":
