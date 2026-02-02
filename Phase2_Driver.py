@@ -209,9 +209,16 @@ def evaluate_alice_with_live_bob(
     grace_after_switch: int
 ) -> Tuple[float, Dict[str, float], bool, bool]:
     """
-    Runs Bob and Alice in lockstep for physics_cycles.
-      Bob: GP2=0, GP3=cosmos
-      Alice: GP2 = (Bob_out & 1), GP3=cosmos
+    Runs Bob and Alice in lockstep while the cosmos does NOT wait.
+
+      Bob:   GP2=0,              GP3=cosmos
+      Alice: GP2=(Bob_out & 1),  GP3=cosmos
+
+    TIMING CONTRACT:
+      * Each emulate_cycle() executes exactly one instruction, but that instruction
+        consumes sim.last_dt world-time ticks (cycles).
+      * The cosmos advances during those ticks (i.e., the universe does not wait).
+      * Output is treated as held constant during the dt ticks consumed.
 
     Returns:
       (fitness, metrics, alice_crashed, bob_crashed)
@@ -236,11 +243,13 @@ def evaluate_alice_with_live_bob(
     bob_crashed = False
     last_bob_gp0 = 0  # if Bob crashes, it stays 0
 
-    for t in range(physics_cycles):
+    t = 0
+    while t < physics_cycles:
         bit3 = cosmos_bits[t]
-        target = cosmos_targets[t]
 
+        # ------------------------------------------------------------
         # Step Bob first (one-way coupling)
+        # ------------------------------------------------------------
         if not bob_crashed:
             bob_out, bob_crash_now = bob.emulate_cycle(gp2_input=0, gp3_input=bit3)
             if bob_crash_now:
@@ -249,9 +258,12 @@ def evaluate_alice_with_live_bob(
             else:
                 last_bob_gp0 = int(bob_out) & 0x01
 
+        # ------------------------------------------------------------
         # Step Alice with GP2 from Bob GP0
+        # ------------------------------------------------------------
         alice_out, alice_crash_now = alice.emulate_cycle(gp2_input=last_bob_gp0, gp3_input=bit3)
         if alice_crash_now:
+            # Mirror your original policy: if Alice crashes, fitness=0, empty metrics
             return 0.0, {}, True, bob_crashed
 
         alice_out = int(alice_out)
@@ -261,20 +273,47 @@ def evaluate_alice_with_live_bob(
             toggles += 1
         last_out = alice_out
 
-        if last_target is None:
-            last_target = target
+        # ------------------------------------------------------------
+        # Determine how much world-time elapsed during this instruction pair
+        # ------------------------------------------------------------
+        dt_a = getattr(alice, "last_dt", 1)
+        dt_b = getattr(bob, "last_dt", 1) if not bob_crashed else 1
 
-        if target != last_target:
-            grace = grace_after_switch
-            last_target = target
+        try:
+            dt = int(max(dt_a, dt_b))
+        except Exception:
+            dt = 1
+        if dt < 1:
+            dt = 1
 
-        if grace > 0:
-            grace -= 1
-            continue
+        # Clamp dt so we don't run off the end of the cosmos arrays
+        if t + dt > physics_cycles:
+            dt = physics_cycles - t
+            if dt < 1:
+                dt = 1
 
-        valid += 1
-        if alice_out == target:
-            correct += 1
+        # ------------------------------------------------------------
+        # Score Alice's (held) output against the evolving cosmos for dt ticks
+        # ------------------------------------------------------------
+        for k in range(dt):
+            target = cosmos_targets[t + k]
+
+            if last_target is None:
+                last_target = target
+            elif target != last_target:
+                grace = grace_after_switch
+                last_target = target
+
+            if grace > 0:
+                grace -= 1
+                continue
+
+            valid += 1
+            if alice_out == target:
+                correct += 1
+
+        # Advance world-time
+        t += dt
 
     fitness = (correct / valid) if valid > 0 else 0.0
 
@@ -284,7 +323,7 @@ def evaluate_alice_with_live_bob(
     entropy = (len(comp) / len(raw)) if len(raw) > 0 else 0.0
 
     metrics = {
-        "Activity": float(toggles / physics_cycles),
+        "Activity": float(toggles / max(1, physics_cycles)),
         "Responsiveness": float(fitness),
         "ChannelEntropy": float(entropy),
         "AlgoDensity": float(len(alice_genome) / MAX_LINES),
@@ -670,8 +709,11 @@ def main():
             while next_apply_chunk in completed_results:
                 results = completed_results.pop(next_apply_chunk)
                 slots = chunk_slots.pop(next_apply_chunk)
-                chunk_slots.pop(next_apply_chunk, None)
                 chunk_i_range.pop(next_apply_chunk, None)
+
+                # --- SAFETY CHECK: ensure task/result alignment ---
+                expected = sum(1 for s in slots if s is not None)
+                assert expected == len(results), (expected, len(results))
 
                 r_idx = 0
                 for slot in slots:
