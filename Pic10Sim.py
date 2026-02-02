@@ -89,9 +89,14 @@ class Pic10Sim:
         if not self.program:
             return 0, False
 
-        idx = self.pc % len(self.program)
-        op_id, operand = self.program[idx]
-        opcode = self.opcode_list[op_id]
+        idx = self.pc & (self.FLASH_SIZE - 1)
+        # Fetch from program if within loaded length; otherwise treat as NOP (blank flash)
+        if idx < len(self.program):
+            op_id, operand = self.program[idx]
+            opcode = self.opcode_list[op_id]
+        else:
+            opcode = "NOP"
+            operand = 0
 
         # --- decode bit ops ---
         bit = None
@@ -175,10 +180,18 @@ class Pic10Sim:
         val = self.read_ram(f)
 
         def set_z(x):
+            x &= 0xFF
             if x == 0:
-                self.ram[0x03] |= 0x04
+                self.ram[0x03] |= 0x04   # Z bit
             else:
                 self.ram[0x03] &= ~0x04
+
+        def set_c(carry_out):
+            # Carry flag is bit0 of STATUS in this simplified model
+            if carry_out:
+                self.ram[0x03] |= 0x01
+            else:
+                self.ram[0x03] &= ~0x01
 
         if op == "MOVLW":
             self.w_reg = f
@@ -188,6 +201,18 @@ class Pic10Sim:
 
         if op == "MOVWF":
             self.write_ram(f, self.w_reg)
+            self.pc += 1
+            return
+
+        if op == "CLRW":
+            self.w_reg = 0
+            set_z(self.w_reg)
+            self.pc += 1
+            return
+
+        if op == "CLRF":
+            self.write_ram(f, 0)
+            set_z(0)
             self.pc += 1
             return
 
@@ -213,14 +238,31 @@ class Pic10Sim:
                 self.write_ram(f, result)
 
         if op == "ADDWF_W":
-            alu(self.w_reg + val, True)
+            s = self.w_reg + val
+            result = s & 0xFF
+            set_c(1 if s > 0xFF else 0)
+            self.w_reg = result
+            set_z(result)
         elif op == "ADDWF_F":
-            alu(self.w_reg + val, False)
+            s = self.w_reg + val
+            result = s & 0xFF
+            set_c(1 if s > 0xFF else 0)
+            self.write_ram(f, result)
+            set_z(result)
 
         elif op == "SUBWF_W":
-            alu(val - self.w_reg, True)
+            d = val - self.w_reg
+            result = d & 0xFF
+            # PIC-style: C=1 means no borrow (val >= W)
+            set_c(1 if val >= self.w_reg else 0)
+            self.w_reg = result
+            set_z(result)
         elif op == "SUBWF_F":
-            alu(val - self.w_reg, False)
+            d = val - self.w_reg
+            result = d & 0xFF
+            set_c(1 if val >= self.w_reg else 0)
+            self.write_ram(f, result)
+            set_z(result)
 
         elif op == "ANDWF_W":
             alu(self.w_reg & val, True)
@@ -258,14 +300,30 @@ class Pic10Sim:
             alu(((val & 0x0F) << 4) | ((val & 0xF0) >> 4), False)
 
         elif op == "RLF_W":
-            alu(((val << 1) | (self.ram[0x03] & 1)), True)
+            carry_in = self.ram[0x03] & 0x01
+            carry_out = 1 if (val & 0x80) else 0
+            result = ((val << 1) | carry_in) & 0xFF
+            set_c(carry_out)
+            alu(result, True)
         elif op == "RLF_F":
-            alu(((val << 1) | (self.ram[0x03] & 1)), False)
+            carry_in = self.ram[0x03] & 0x01
+            carry_out = 1 if (val & 0x80) else 0
+            result = ((val << 1) | carry_in) & 0xFF
+            set_c(carry_out)
+            alu(result, False)
 
         elif op == "RRF_W":
-            alu((val >> 1), True)
+            carry_in = self.ram[0x03] & 0x01
+            carry_out = 1 if (val & 0x01) else 0
+            result = ((carry_in << 7) | (val >> 1)) & 0xFF
+            set_c(carry_out)
+            alu(result, True)
         elif op == "RRF_F":
-            alu((val >> 1), False)
+            carry_in = self.ram[0x03] & 0x01
+            carry_out = 1 if (val & 0x01) else 0
+            result = ((carry_in << 7) | (val >> 1)) & 0xFF
+            set_c(carry_out)
+            alu(result, False)
 
         elif op == "INCFSZ_W":
             result = (val + 1) & 0xFF
