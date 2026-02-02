@@ -31,6 +31,7 @@ class Pic10Sim:
         self.pc = 0
         self.stack = []
         self.cycles = 0
+        self.last_dt = 0
         self.crash_reason = None
 
         # STATUS register (stable POR state)
@@ -105,7 +106,9 @@ class Pic10Sim:
             operand &= 0x1F
 
         # --- execute ---
+        cycles_before = self.cycles
         self.step(opcode, operand, bit)
+        self.last_dt = max(1, self.cycles - cycles_before)
 
         return self.ram[0x06] & self.GPIO_OUT_MASK, bool(self.crash_reason)
 
