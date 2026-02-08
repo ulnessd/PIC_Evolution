@@ -404,28 +404,38 @@ def ensure_i4_axes(metrics: dict, fit_used: float, a_genome=None, b_genome=None)
     Ensure the I4 axes exist without enabling expensive partner sampling.
     - PartnerFloor: for seeding/single eval, define as the observed fit_used (0..1).
     - ResponseVariance: 0 for single eval.
+    - RelianceIndex: Set based on fitness.
+    - SignalSparsity: Set to 0.0 for seeding (since no interaction).
     - ChannelEntropy: alias from ChannelEntropyCompress if needed.
     - OpcodeEntropy: compute from genome if missing.
     """
     if not isinstance(metrics, dict):
         metrics = {}
 
+    # Ensure the axes for I4 are populated
+    if "RelianceIndex" not in metrics:
+        metrics["RelianceIndex"] = float(fit_used)  # Use fitness as a proxy for reliance during seeding
+
+    if "SignalSparsity" not in metrics:
+        metrics["SignalSparsity"] = 0.0  # No signal during seeding
+
     if "PartnerFloor" not in metrics:
-        metrics["PartnerFloor"] = float(max(0.0, min(0.999, fit_used)))
+        metrics["PartnerFloor"] = float(max(0.0, min(0.999, fit_used)))  # Default to fit_used for PartnerFloor
+
     if "ResponseVariance" not in metrics:
-        metrics["ResponseVariance"] = 0.0
+        metrics["ResponseVariance"] = 0.0  # Default to 0.0 since there's no partner variance during seeding
 
     if "ChannelEntropy" not in metrics and "ChannelEntropyCompress" in metrics:
         metrics["ChannelEntropy"] = float(metrics["ChannelEntropyCompress"])
 
-    # If evaluator doesn't provide opcode entropy, compute from genome(s).
+    # Compute OpcodeEntropy if missing
     if "OpcodeEntropy" not in metrics:
-        # If you prefer a pair-level value, use mean of A and B entropies.
         ea = opcode_entropy_from_genome(a_genome) if a_genome is not None else 0.0
         eb = opcode_entropy_from_genome(b_genome) if b_genome is not None else 0.0
         metrics["OpcodeEntropy"] = float(0.5 * (ea + eb))
 
     return metrics
+
 
 # ----------------------------
 # Mirror metrics (I4)
@@ -560,11 +570,11 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
         metrics = ensure_bob_latency_norm(metrics, args.cycles)
 
         fit2 = reshape_fitness(fit, metrics, ws)
+        # Ensure that I4-specific axes are populated during seeding
         if world_name == "I4":
-            # During seeding we do not do partner sampling, but we still need I4 axes
-            # to exist so bins don't silently collapse or skip everything.
             metrics = ensure_i4_axes(metrics, fit2, a_genome=task[0], b_genome=task[1])
 
+        # Proceed with binning
         idx = world_bin_index(metrics, ws, missing_axis_tracker=missing_axis)
         if idx is None:
             continue
@@ -667,10 +677,10 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
 
 
     write_header = not os.path.exists(metrics_path)
-    csv_f = open(metrics_path, "a", newline="")
-    csv_w = csv.DictWriter(csv_f, fieldnames=fieldnames)
-    if write_header:
-        csv_w.writeheader()
+   # csv_f = open(metrics_path, "a", newline="")
+   # csv_w = csv.DictWriter(csv_f, fieldnames=fieldnames)
+   # if write_header:
+   #     csv_w.writeheader()
 
 
     total_batches = (args.n_pairs + args.pairs_per_batch - 1) // args.pairs_per_batch
@@ -1077,7 +1087,7 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
                 if k in metrics:
                     row[k] = float(metrics[k])
 
-            csv_w.writerow(row)
+            #csv_w.writerow(row)
 
         evaluated += n_this
 
