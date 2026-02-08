@@ -116,6 +116,37 @@ def _genome_sig(genome):
     # hashable identity for grouping within a batch (polygamy averaging)
     return tuple((int(op), int(arg)) for op, arg in genome)
 
+import math
+
+def opcode_entropy_from_genome(genome):
+    """
+    Normalized opcode entropy in [0,1).
+    Computed purely from the opcode histogram in the genome (cheap, deterministic).
+    """
+    if not genome:
+        return 0.0
+    counts = {}
+    for op, _arg in genome:
+        opi = int(op)
+        counts[opi] = counts.get(opi, 0) + 1
+
+    n = sum(counts.values())
+    if n <= 0:
+        return 0.0
+
+    H = 0.0
+    for c in counts.values():
+        p = c / n
+        if p > 0:
+            H -= p * math.log(p)
+
+    # Normalize by log(K) where K is number of possible opcodes in this universe.
+    # OPCODE_HASH is imported; it’s a dict-like over opcodes.
+    K = max(2, len(OPCODE_HASH))
+    Hn = H / math.log(K)
+    return float(min(0.999, max(0.0, Hn)))
+
+
 def uniform_bin_sample_key(archive, rng):
     # Uniform over filled bins (MAP-Elites style)
     return rng.choice(list(archive.keys()))
@@ -226,11 +257,27 @@ def _bin01(v: float) -> int:
     v = 0.0 if v < 0.0 else 0.999 if v >= 1.0 else v
     return int(v * GRID_SIZE)
 
-def world_bin_index(metrics, world_spec):
+def world_bin_index(metrics, world_spec, missing_axis_tracker=None):
+    """
+    Return a Phase4 world-specific bin index.
+    If a required axis key is missing from the *Phase4-produced* metrics dict,
+    return None and update missing_axis_tracker (skip+summary behavior).
+    """
     axes_keys = world_spec.get("axes_keys", None)
     if axes_keys is None:
         return get_grid_index(metrics)
-    vals = [float(metrics.get(k, 0.0)) for k in axes_keys]
+
+    # Detect missing descriptor keys (do NOT silently default to 0.0)
+    if missing_axis_tracker is not None:
+        missing = [k for k in axes_keys if k not in metrics]
+        if missing:
+            missing_axis_tracker["total"] += 1
+            counts = missing_axis_tracker["counts"]
+            for k in missing:
+                counts[k] = counts.get(k, 0) + 1
+            return None
+
+    vals = [float(metrics[k]) for k in axes_keys]
     return tuple(_bin01(v) for v in vals)
 
 # ----------------------------
@@ -352,6 +399,33 @@ def ensure_bob_latency_norm(metrics: dict, cycles: int):
         metrics["BobLatencyNorm"] = min(0.999, max(0.0, v / max(1, int(cycles))))
     return metrics
 
+def ensure_i4_axes(metrics: dict, fit_used: float, a_genome=None, b_genome=None):
+    """
+    Ensure the I4 axes exist without enabling expensive partner sampling.
+    - PartnerFloor: for seeding/single eval, define as the observed fit_used (0..1).
+    - ResponseVariance: 0 for single eval.
+    - ChannelEntropy: alias from ChannelEntropyCompress if needed.
+    - OpcodeEntropy: compute from genome if missing.
+    """
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    if "PartnerFloor" not in metrics:
+        metrics["PartnerFloor"] = float(max(0.0, min(0.999, fit_used)))
+    if "ResponseVariance" not in metrics:
+        metrics["ResponseVariance"] = 0.0
+
+    if "ChannelEntropy" not in metrics and "ChannelEntropyCompress" in metrics:
+        metrics["ChannelEntropy"] = float(metrics["ChannelEntropyCompress"])
+
+    # If evaluator doesn't provide opcode entropy, compute from genome(s).
+    if "OpcodeEntropy" not in metrics:
+        # If you prefer a pair-level value, use mean of A and B entropies.
+        ea = opcode_entropy_from_genome(a_genome) if a_genome is not None else 0.0
+        eb = opcode_entropy_from_genome(b_genome) if b_genome is not None else 0.0
+        metrics["OpcodeEntropy"] = float(0.5 * (ea + eb))
+
+    return metrics
 
 # ----------------------------
 # Mirror metrics (I4)
@@ -398,6 +472,14 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
     # Two coevolving archives (Part4 behavior)
     alice_archive = {}
     bob_archive = {}
+
+    # Track missing Phase4 axis keys during binning (skip+summary)
+    missing_axis = {
+        "total": 0,          # number of evaluations where >=1 axis key was missing
+        "counts": {},        # key -> count
+        "last_report": 0,    # used to print per-batch delta
+    }
+
 
     # ------------------------------------------------------------
     # TRUE Phase4 seeding: evaluate EVERY Phase3 correlated pair in this world,
@@ -478,7 +560,14 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
         metrics = ensure_bob_latency_norm(metrics, args.cycles)
 
         fit2 = reshape_fitness(fit, metrics, ws)
-        idx = world_bin_index(metrics, ws)
+        if world_name == "I4":
+            # During seeding we do not do partner sampling, but we still need I4 axes
+            # to exist so bins don't silently collapse or skip everything.
+            metrics = ensure_i4_axes(metrics, fit2, a_genome=task[0], b_genome=task[1])
+
+        idx = world_bin_index(metrics, ws, missing_axis_tracker=missing_axis)
+        if idx is None:
+            continue
 
         (ga, gb, *_rest) = task
 
@@ -510,6 +599,16 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
         f"[{world_name}] Seeded archives from Phase3 (true rebinned): "
         f"binsA={len(alice_archive)} binsB={len(bob_archive)} seeded_pairs={seeded}"
     )
+    if len(alice_archive) == 0 or len(bob_archive) == 0:
+        # With skip-on-missing-axis enabled, an empty archive means we cannot proceed.
+        # Print diagnostics and stop this world cleanly.
+        if missing_axis["total"] > 0:
+            items = sorted(missing_axis["counts"].items(), key=lambda kv: kv[1], reverse=True)
+            top = ", ".join([f"{k}:{v}" for (k, v) in items[:6]])
+            print(f"[{world_name}] ERROR: empty seeded archive. Missing-axis events: total={missing_axis['total']} top={top}")
+        else:
+            print(f"[{world_name}] ERROR: empty seeded archive but no missing-axis events. Likely all pairs crashed in-world.")
+        return
 
 
     # Output paths
@@ -869,6 +968,8 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
 
             # Final fitness shaping (if configured)
             fit_used = reshape_fitness(fit_used, metrics_used, ws)
+            if world_name == "I4":
+                metrics_used = ensure_i4_axes(metrics_used, fit_used, a_genome=a_child, b_genome=b_child)
 
             final_fit[i] = float(fit_used)
             final_metrics[i] = metrics_used
@@ -908,7 +1009,9 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
             a_crash, b_crash = final_crash[i]
 
             # bin per pairing metrics (Option 1)
-            idx = world_bin_index(metrics, ws)
+            idx = world_bin_index(metrics, ws, missing_axis_tracker=missing_axis)
+            if idx is None:
+                continue
 
             fit_used_a = fit_raw
             fit_used_b = fit_raw
@@ -1058,12 +1161,25 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
             sf.flush()
 
             # ---- terminal line ----
+            miss_total = missing_axis["total"]
+            miss_delta = miss_total - missing_axis["last_report"]
+            missing_axis["last_report"] = miss_total
+
+            miss_note = ""
+            if miss_total > 0:
+                # show top 2 missing keys (cumulative)
+                items = sorted(missing_axis["counts"].items(), key=lambda kv: kv[1], reverse=True)
+                top = ", ".join([f"{k}:{v}" for (k, v) in items[:2]])
+                miss_note = f"  missingAxis(+{miss_delta}, total={miss_total}, top={top})"
+
             print(
                 f"[{world_name}] batch {batch + 1}/{total_batches}  "
                 f"evaluated={evaluated}  binsA={len(alice_archive)} binsB={len(bob_archive)}  "
                 f"avgFit={avg_fit:.4f}  batchBest={batch_best:.4f}  archiveBest={archive_best:.4f}  "
                 f"elapsed={elapsed / 60.0:.2f}m  rate={rate:.1f}/s"
+                f"{miss_note}"
             )
+
 
 
     sf.close()
