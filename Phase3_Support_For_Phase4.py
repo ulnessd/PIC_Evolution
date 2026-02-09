@@ -700,7 +700,7 @@ def evaluate_pair_variant3_with_reliance(
         "MutualSignalRate": float((togA0 + togB0) / (2.0 * max(1, physics_cycles))),
         "SyncIndex": float(_coordinated_change_index(outA0, outB0, lag=1)),
         "BobLatency": float(min(0.999, (sum(latB) / max(1, len(latB))) / max(1, physics_cycles))),
-        "RecoveryTime": float(min(0.999, (sum(rec_list) / max(1, len(rec_list))) / max(1, physics_cycles))),
+        "RecoveryTime": float(min(0.999, (sum(rec_list) / max(1, len(rec_list))) / max(1, grace_after_switch))),
         "DtBurstiness": float(min(0.999, _dt_burstiness(dt_series_live))),
         "MemoryUtilization": float(min(0.999, (len(set(memA) | set(memB)) / 32.0))),
         "OpcodeEntropy": float(_opcode_entropy_norm(alice_genome, bob_genome)),
