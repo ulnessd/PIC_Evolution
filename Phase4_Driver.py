@@ -252,6 +252,8 @@ def reshape_fitness(fit, metrics, world_spec):
 # Axes / binning (world-specific)
 # ----------------------------
 GRID_SIZE = 16  # must match Phase3 GRID_SIZE
+GENOME_MAX_LINES = 256  # <-- set to your project’s intended max genome length
+
 
 def _bin01(v: float) -> int:
     v = 0.0 if v < 0.0 else 0.999 if v >= 1.0 else v
@@ -260,25 +262,67 @@ def _bin01(v: float) -> int:
 def world_bin_index(metrics, world_spec, missing_axis_tracker=None):
     """
     Return a Phase4 world-specific bin index.
-    If a required axis key is missing from the *Phase4-produced* metrics dict,
-    return None and update missing_axis_tracker (skip+summary behavior).
+
+    If a required axis key is missing from the metrics dict:
+      - update missing_axis_tracker (skip+summary behavior)
+      - print limited debug info (first few events only)
+      - return None
     """
     axes_keys = world_spec.get("axes_keys", None)
     if axes_keys is None:
         return get_grid_index(metrics)
 
-    # Detect missing descriptor keys (do NOT silently default to 0.0)
-    if missing_axis_tracker is not None:
-        missing = [k for k in axes_keys if k not in metrics]
-        if missing:
+    # Defensive: metrics should be a dict
+    if not isinstance(metrics, dict):
+        if missing_axis_tracker is not None:
+            missing_axis_tracker["total"] += 1
+            counts = missing_axis_tracker["counts"]
+            # treat everything as missing
+            for k in axes_keys:
+                counts[k] = counts.get(k, 0) + 1
+        # limited debug
+        if getattr(world_bin_index, "_dbg_left", 8) > 0:
+            print("DEBUG world_bin_index: metrics is not a dict; skipping. type=", type(metrics))
+            world_bin_index._dbg_left = getattr(world_bin_index, "_dbg_left", 8) - 1
+        return None
+
+    missing = [k for k in axes_keys if k not in metrics]
+    if missing:
+        if missing_axis_tracker is not None:
             missing_axis_tracker["total"] += 1
             counts = missing_axis_tracker["counts"]
             for k in missing:
                 counts[k] = counts.get(k, 0) + 1
-            return None
+
+        # Limited debug (prints only first N missing events across the run)
+        dbg_left = getattr(world_bin_index, "_dbg_left", 8)
+        if dbg_left > 0:
+            world = world_spec.get("name", "<world?>")
+            print(f"\nDEBUG world_bin_index missingAxis in {world}: missing={missing}")
+            print(f"DEBUG has RelianceIndex? {'RelianceIndex' in metrics} | has SignalSparsity? {'SignalSparsity' in metrics}")
+            # show a small sample of keys present (sorted for sanity)
+            ks = sorted(metrics.keys())
+            print(f"DEBUG metrics keys count={len(ks)} sample={ks[:40]}")
+            # if the missing keys are present under near-miss spellings, show those
+            near = [k for k in ks if "Reliance" in k or "Spars" in k or "Signal" in k]
+            if near:
+                print(f"DEBUG near-miss keys (contain Reliance/Signal/Spars): {near[:40]}")
+            world_bin_index._dbg_left = dbg_left - 1
+
+        return None
 
     vals = [float(metrics[k]) for k in axes_keys]
-    return tuple(_bin01(v) for v in vals)
+    idx = tuple(_bin01(v) for v in vals)
+
+    # limited bin-value debug (first 10 times per world_spec dict instance)
+    if world_spec.get("_debug_print_bins", 0) < 10:
+        world_spec["_debug_print_bins"] = world_spec.get("_debug_print_bins", 0) + 1
+        wname = world_spec.get("name", "<world?>")
+        print(f"DEBUG BIN {wname}: keys={axes_keys} vals={[round(v, 4) for v in vals]} idx={idx}")
+
+    return idx
+
+
 
 # ----------------------------
 # World specs (I0–I4)
@@ -360,8 +404,11 @@ def get_world_specs(args):
     specs["I4"] = dict(base)
     specs["I4"].update({
         "mirror_k_partners": args.mirror_k_partners,
-        "axes_keys": ("PartnerFloor", "ChannelEntropy", "OpcodeEntropy", "ResponseVariance"),
+        "axes_keys": ("PartnerFloor", "ChannelEntropySpread", "OpcodeEntropySpread", "ResponseVariance"),
     })
+
+    for k, v in specs.items():
+        v["name"] = k
 
     return specs
 
@@ -385,56 +432,103 @@ def add_protocol_stability(metrics_run1, metrics_run2):
     metrics_run1["ProtocolStability"] = float(stability)
     return metrics_run1
 
-def ensure_bob_latency_norm(metrics: dict, cycles: int):
+import math
+
+def ensure_bob_latency_norm(metrics: dict, L_star: float = 5e-4):
     """
-    Normalize BobLatency into [0,1) as BobLatencyNorm.
-    If evaluator already supplies BobLatencyNorm, leave it.
+    BobLatency is already a small fraction (~1e-4..1e-3).
+    Map it nonlinearly into [0,1) so it spreads across bins.
     """
     if not isinstance(metrics, dict):
         return metrics
-    if "BobLatencyNorm" in metrics:
+    if "BobLatency" not in metrics:
         return metrics
-    if "BobLatency" in metrics:
-        v = float(metrics.get("BobLatency", 0.0))
-        metrics["BobLatencyNorm"] = min(0.999, max(0.0, v / max(1, int(cycles))))
+
+    L = float(metrics.get("BobLatency", 0.0))
+    if L < 0:
+        L = 0.0
+
+    # Saturating map: small L -> near 0, L ~ L* -> ~0.63, large L -> ->1
+    norm = 1.0 - math.exp(-L / max(1e-12, float(L_star)))
+    metrics["BobLatencyNorm"] = float(min(0.999, max(0.0, norm)))
     return metrics
 
-def ensure_i4_axes(metrics: dict, fit_used: float, a_genome=None, b_genome=None):
+
+def ensure_axes(metrics: dict, fit_used: float, world_name: str, a_genome=None, b_genome=None, ws: dict = None):
     """
-    Ensure the I4 axes exist without enabling expensive partner sampling.
-    - PartnerFloor: for seeding/single eval, define as the observed fit_used (0..1).
-    - ResponseVariance: 0 for single eval.
-    - RelianceIndex: Set based on fitness.
-    - SignalSparsity: Set to 0.0 for seeding (since no interaction).
-    - ChannelEntropy: alias from ChannelEntropyCompress if needed.
-    - OpcodeEntropy: compute from genome if missing.
+    Ensure required axes exist for the current world.
+    This should prevent 'missingAxis' binning failures even if some evaluation paths
+    return partial metrics.
     """
     if not isinstance(metrics, dict):
         metrics = {}
 
-    # Ensure the axes for I4 are populated
-    if "RelianceIndex" not in metrics:
-        metrics["RelianceIndex"] = float(fit_used)  # Use fitness as a proxy for reliance during seeding
+    # --- Always-available fallbacks (never delete existing keys) ---
+    metrics.setdefault("RelianceIndex", float(fit_used))
+    metrics.setdefault("SignalSparsity", 0.0)
+    metrics.setdefault("PartnerFloor", float(max(0.0, min(0.999, fit_used))))
+    metrics.setdefault("ResponseVariance", 0.0)
 
-    if "SignalSparsity" not in metrics:
-        metrics["SignalSparsity"] = 0.0  # No signal during seeding
-
-    if "PartnerFloor" not in metrics:
-        metrics["PartnerFloor"] = float(max(0.0, min(0.999, fit_used)))  # Default to fit_used for PartnerFloor
-
-    if "ResponseVariance" not in metrics:
-        metrics["ResponseVariance"] = 0.0  # Default to 0.0 since there's no partner variance during seeding
-
+    # Some evaluators supply ChannelEntropy but I4 bins on ChannelEntropy (or vice versa)
+    if "ChannelEntropyCompress" not in metrics and "ChannelEntropy" in metrics:
+        metrics["ChannelEntropyCompress"] = float(metrics["ChannelEntropy"])
     if "ChannelEntropy" not in metrics and "ChannelEntropyCompress" in metrics:
         metrics["ChannelEntropy"] = float(metrics["ChannelEntropyCompress"])
 
-    # Compute OpcodeEntropy if missing
+    # AlgoDensity can be reconstructed from genomes (if provided)
+    if "AlgoDensity" not in metrics and (a_genome is not None) and (b_genome is not None):
+        try:
+            metrics["AlgoDensity"] = float((len(a_genome) + len(b_genome)) / (2.0 * GENOME_MAX_LINES))
+        except Exception:
+            metrics["AlgoDensity"] = 0.0
+
+    # OpcodeEntropy (genome-derived): compute if required by this world and missing
     if "OpcodeEntropy" not in metrics:
-        ea = opcode_entropy_from_genome(a_genome) if a_genome is not None else 0.0
-        eb = opcode_entropy_from_genome(b_genome) if b_genome is not None else 0.0
-        metrics["OpcodeEntropy"] = float(0.5 * (ea + eb))
+        needed = False
+        if isinstance(ws, dict):
+            needed = ("OpcodeEntropy" in ws.get("axes_keys", ())) or ("OpcodeEntropySpread" in ws.get("axes_keys", ()))
+        if needed and (a_genome is not None) and (b_genome is not None):
+            oe_a = opcode_entropy_from_genome(a_genome)
+            oe_b = opcode_entropy_from_genome(b_genome)
+            metrics["OpcodeEntropy"] = float(0.5 * (oe_a + oe_b))
+
+
+    # Activity fallback: if absent but MutualSignalRate exists, use it (they are defined similarly)
+    if "Activity" not in metrics and "MutualSignalRate" in metrics:
+        metrics["Activity"] = float(metrics["MutualSignalRate"])
+
+    # MutualSignalRate fallback: if absent but Activity exists, use it
+    if "MutualSignalRate" not in metrics and "Activity" in metrics:
+        metrics["MutualSignalRate"] = float(metrics["Activity"])
+
+
+
+    # I4: ensure OpcodeEntropy if missing (needs genomes)
+    if world_name == "I4":
+        # ChannelEntropySpread: 0 when CE=1, grows as CE drops below 1
+        if "ChannelEntropy" in metrics:
+            ce = float(metrics.get("ChannelEntropy", 0.0))
+            hi = max(0.0, 1.0 - min(0.999, max(0.0, ce)))  # in [0,1)
+            c0 = 0.10  # “interesting” scale: CE in [0.90, 1.00]
+            alpha = 0.5  # sqrt expands small values
+            metrics["ChannelEntropySpread"] = float(min(0.999, (hi / c0) ** alpha))
+
+        if "OpcodeEntropy" in metrics:
+            oe = float(metrics.get("OpcodeEntropy", 0.0))
+            hi = max(0.0, 1.0 - min(0.999, max(0.0, oe)))
+            o0 = 0.10
+            alpha = 0.5
+            metrics["OpcodeEntropySpread"] = float(min(0.999, (hi / o0) ** alpha))
+
+    # --- Finally: if ws provided, guarantee ALL axes_keys exist ---
+    if isinstance(ws, dict):
+        for k in ws.get("axes_keys", ()):
+            if k not in metrics:
+                metrics[k] = 0.0
 
     return metrics
+
+
 
 
 # ----------------------------
@@ -567,14 +661,15 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
                 metrics = add_protocol_stability(metrics, metrics_r2)
 
         # Ensure BobLatencyNorm exists before binning
-        metrics = ensure_bob_latency_norm(metrics, args.cycles)
+        if world_name == "I1":
+            metrics = ensure_bob_latency_norm(metrics, L_star=float(args.latency_scale))
+
 
         fit2 = reshape_fitness(fit, metrics, ws)
-        # Ensure that I4-specific axes are populated during seeding
-        if world_name == "I4":
-            metrics = ensure_i4_axes(metrics, fit2, a_genome=task[0], b_genome=task[1])
 
-        # Proceed with binning
+        # Ensure required axes for THIS world before binning (works for I0–I4)
+        metrics = ensure_axes(metrics, fit2, world_name, a_genome=task[0], b_genome=task[1], ws=ws)
+
         idx = world_bin_index(metrics, ws, missing_axis_tracker=missing_axis)
         if idx is None:
             continue
@@ -582,26 +677,47 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
         (ga, gb, *_rest) = task
 
         # Insert into Alice archive (Alice genome competes on fit2 in this bin)
+        # Insert into Alice archive (Alice genome competes on fit2 in this bin)
         prev = alice_archive.get(idx)
         if (prev is None) or (fit2 > float(prev.get("fit", -1e9))):
+            metrics_a = dict(metrics)
+            metrics_b = dict(metrics)
+
+            # Side-specific opcode entropy + genome length (safe, no MAX_GENOME_LEN needed)
+            metrics_a["OpcodeEntropy_A"] = float(opcode_entropy_from_genome(ga))
+            metrics_b["OpcodeEntropy_B"] = float(opcode_entropy_from_genome(gb))
+            metrics_a["AlgoDensity_A"] = float(len(ga))
+            metrics_b["AlgoDensity_B"] = float(len(gb))
+
+
             alice_archive[idx] = {
                 "id": "seed",
                 "genome": ga,
                 "fit": float(fit2),
-                "metrics": metrics,
+                "metrics": metrics_a,
                 "origin": {"phase": 3, "seed": True, "world": world_name, "side": "A"},
             }
 
         # Insert into Bob archive (Bob genome competes on fit2 in this bin)
         prev = bob_archive.get(idx)
         if (prev is None) or (fit2 > float(prev.get("fit", -1e9))):
+            # IMPORTANT: reuse the same metrics_a/metrics_b logic if this branch runs independently
+            metrics_a = dict(metrics)
+            metrics_b = dict(metrics)
+
+            metrics_a["OpcodeEntropy_A"] = float(opcode_entropy_from_genome(ga))
+            metrics_b["OpcodeEntropy_B"] = float(opcode_entropy_from_genome(gb))
+            metrics_a["AlgoDensity_A"] = float(len(ga))
+            metrics_b["AlgoDensity_B"] = float(len(gb))
+
             bob_archive[idx] = {
                 "id": "seed",
                 "genome": gb,
                 "fit": float(fit2),
-                "metrics": metrics,
+                "metrics": metrics_b,
                 "origin": {"phase": 3, "seed": True, "world": world_name, "side": "B"},
             }
+
 
         seeded += 1
 
@@ -822,6 +938,11 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
         a_elites = [genome_from_record(rec) for rec in alice_archive.values()]
         b_elites = [genome_from_record(rec) for rec in bob_archive.values()]
 
+        # ---- I4 batch-level quick checks ----
+        if world_name == "I4":
+            i4_gate_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+            i4_var_nonzero = 0
+
         for i in range(n_this):
             fit_raw, metrics, a_crash, b_crash = results[i]
             a_child = children_meta[i]["a_genome"]
@@ -829,9 +950,15 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
 
             fit_used = float(fit_raw)
             metrics_used = dict(metrics) if isinstance(metrics, dict) else {}
+            if a_crash or b_crash:
+                final_fit[i] = 0.0
+                final_metrics[i] = metrics_used  # keep whatever we got for debugging
+                final_crash[i] = (a_crash, b_crash)
+                continue
+
 
             # Normalize BobLatency -> BobLatencyNorm on the metrics we will keep
-            metrics_used = ensure_bob_latency_norm(metrics_used, args.cycles)
+            metrics_used = ensure_bob_latency_norm(metrics_used, L_star=float(args.latency_scale))
 
 
             # Verify opcode mapping hash if present
@@ -853,9 +980,10 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
 
                 fit2, metrics2, _ac2, _bc2 = _phase4_eval_one(tuple(t2b))
                 metrics2 = dict(metrics2) if isinstance(metrics2, dict) else {}
-                metrics2 = ensure_bob_latency_norm(metrics2, args.cycles)
+                metrics2 = ensure_bob_latency_norm(metrics2, L_star=float(args.latency_scale))
 
                 metrics_used = add_protocol_stability(metrics_used, metrics2)
+
 
             # Mirror: Option B aggregate fitness across partners (k draws each side)
             # Mirror: Option B aggregate fitness across partners with audition gating (Path B)
@@ -976,10 +1104,33 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
                         metrics_used["FitnessLive"] = float(fit_used)
                         metrics_used = add_mirror_metrics(metrics_used, fit_list)
 
+            # ---- I4 quick checks (per-child, accumulate over this batch) ----
+            if world_name == "I4":
+                i4_gate_counts[int(metrics_used.get("I4GateStage", 0))] += 1
+                if float(metrics_used.get("ResponseVariance", 0.0)) > 0.0:
+                    i4_var_nonzero += 1
+
             # Final fitness shaping (if configured)
             fit_used = reshape_fitness(fit_used, metrics_used, ws)
-            if world_name == "I4":
-                metrics_used = ensure_i4_axes(metrics_used, fit_used, a_genome=a_child, b_genome=b_child)
+            metrics_used = ensure_axes(metrics_used, fit_used, world_name, a_genome=a_child, b_genome=b_child, ws=ws)
+
+            # Final fitness shaping (if configured)
+            # Final fitness shaping (if configured)
+            fit_used = reshape_fitness(fit_used, metrics_used, ws)
+            # --- DEBUG: check RelianceIndex before ensure_axes ---
+            if world_name == "I3" and ws.get("_dbg_ri", 0) < 10:
+                ws["_dbg_ri"] = ws.get("_dbg_ri", 0) + 1
+                print(
+                    "DEBUG I3 pre-ensure RI=",
+                    metrics_used.get("RelianceIndex", "<missing>"),
+                    "fit_used=",
+                    fit_used,
+                    "has_RI=",
+                    ("RelianceIndex" in metrics_used),
+                    "crash=",
+                    (a_crash, b_crash),
+                )
+            metrics_used = ensure_axes(metrics_used, fit_used, world_name, a_genome=a_child, b_genome=b_child, ws=ws)
 
             final_fit[i] = float(fit_used)
             final_metrics[i] = metrics_used
@@ -1018,6 +1169,10 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
             b_sig = children_meta[i]["b_sig"]
             a_crash, b_crash = final_crash[i]
 
+            # --- Do NOT bin/insert crashed evaluations ---
+            if a_crash or b_crash:
+                continue
+
             # bin per pairing metrics (Option 1)
             idx = world_bin_index(metrics, ws, missing_axis_tracker=missing_axis)
             if idx is None:
@@ -1029,12 +1184,28 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
                 fit_used_a = float(a_fit_map.get(a_sig, fit_raw))
                 fit_used_b = float(b_fit_map.get(b_sig, fit_raw))
 
-            # Construct records
+            # Construct records (make side-specific copies of metrics, then add per-side fields)
+            metrics_a = dict(metrics)
+            metrics_b = dict(metrics)
+
+            # Side-specific (genome-only) metrics for later analysis / debugging asymmetry
+            # Keep existing pair-level keys (e.g., ResponseVariance, PartnerFloor, etc.) unchanged.
+            try:
+                metrics_a["OpcodeEntropy_A"] = float(opcode_entropy_from_genome(a_child))
+                metrics_b["OpcodeEntropy_B"] = float(opcode_entropy_from_genome(b_child))
+            except Exception:
+                # If opcode_entropy_from_genome ever fails, don't crash the run
+                metrics_a["OpcodeEntropy_A"] = None
+                metrics_b["OpcodeEntropy_B"] = None
+
+            metrics_a["AlgoDensity_A"] = float(len(a_child))
+            metrics_b["AlgoDensity_B"] = float(len(b_child))
+
             a_rec = {
                 "id": str(uuid.uuid4()),
                 "genome": a_child,
                 "fit": fit_used_a,
-                "metrics": metrics,
+                "metrics": metrics_a,
                 "origin": {
                     "world": world_name,
                     "batch": batch,
@@ -1048,7 +1219,7 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
                 "id": str(uuid.uuid4()),
                 "genome": b_child,
                 "fit": fit_used_b,
-                "metrics": metrics,
+                "metrics": metrics_b,
                 "origin": {
                     "world": world_name,
                     "batch": batch,
@@ -1058,6 +1229,7 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
                     "side": "B",
                 },
             }
+
 
             # Insert / replace if better
             if (idx not in alice_archive) or (fit_used_a > float(alice_archive[idx].get("fit", -1e9))):
@@ -1115,7 +1287,10 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
             rate = evaluated / elapsed if elapsed > 0 else 0.0
 
             # ---- batch-level diagnostics (from this batch only) ----
-            batch_fit = [float(x) for x in final_fit[:n_this]]  # fit used for insertion logic
+            batch_fit = [
+                float(final_fit[i]) for i in range(n_this)
+                if final_crash[i] is not None and not (final_crash[i][0] or final_crash[i][1])
+            ]
             avg_fit = (sum(batch_fit) / len(batch_fit)) if batch_fit else float("nan")
             batch_best = max(batch_fit) if batch_fit else float("nan")
 
@@ -1194,7 +1369,7 @@ def run_world(world_name, args, base_archive, bits_a, bits_b, targets):
 
     sf.close()
 
-    csv_f.close()
+   # csv_f.close()
 
 # ----------------------------
 # Main
@@ -1235,6 +1410,9 @@ def main():
     ap.add_argument("--mirror_k_partners", type=int, default=3, help="I4: extra partners per side (k)")
 
     ap.add_argument("--seed", type=int, default=0)
+
+    ap.add_argument("--latency_scale", type=float, default=5e-4,
+                    help="Latency scale L* for BobLatencyNorm nonlinear normalization")
 
     args = ap.parse_args()
 
